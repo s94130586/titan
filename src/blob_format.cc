@@ -36,15 +36,12 @@ bool operator==(const BlobRecord& lhs, const BlobRecord& rhs) {
 
 void BlobEncoder::EncodeRecord(const BlobRecord& record) {
   record_buffer_.clear();
-  record.EncodeTo(&record_buffer_);
-  EncodeSlice(record_buffer_);
-}
-
-void BlobEncoder::EncodeSlice(const Slice& record) {
   compressed_buffer_.clear();
+
   CompressionType compression;
-  record_ =
-      Compress(*compression_info_, record, &compressed_buffer_, &compression);
+  record.EncodeTo(&record_buffer_);
+  record_ = Compress(compression_info_, record_buffer_, &compressed_buffer_,
+                     &compression);
 
   assert(record_.size() < std::numeric_limits<uint32_t>::max());
   EncodeFixed32(header_ + 4, static_cast<uint32_t>(record_.size()));
@@ -65,14 +62,13 @@ Status BlobDecoder::DecodeHeader(Slice* src) {
   if (!GetFixed32(src, &record_size_) || !GetChar(src, &compression)) {
     return Status::Corruption("BlobHeader");
   }
-
   compression_ = static_cast<CompressionType>(compression);
+
   return Status::OK();
 }
 
 Status BlobDecoder::DecodeRecord(Slice* src, BlobRecord* record,
-                                 OwnedSlice* buffer,
-                                 MemoryAllocator* allocator) {
+                                 OwnedSlice* buffer) {
   TEST_SYNC_POINT_CALLBACK("BlobDecoder::DecodeRecord", &crc_);
 
   Slice input(src->data(), record_size_);
@@ -86,8 +82,8 @@ Status BlobDecoder::DecodeRecord(Slice* src, BlobRecord* record,
     return DecodeInto(input, record);
   }
   UncompressionContext ctx(compression_);
-  UncompressionInfo info(ctx, *uncompression_dict_, compression_);
-  Status s = Uncompress(info, input, buffer, allocator);
+  UncompressionInfo info(ctx, uncompression_dict_, compression_);
+  Status s = Uncompress(info, input, buffer);
   if (!s.ok()) {
     return s;
   }
@@ -129,9 +125,51 @@ Status BlobIndex::DecodeFrom(Slice* src) {
   return s;
 }
 
-bool operator==(const BlobIndex& lhs, const BlobIndex& rhs) {
-  return (lhs.file_number == rhs.file_number &&
-          lhs.blob_handle == rhs.blob_handle);
+void BlobIndex::EncodeDeletionMarkerTo(std::string* dst) {
+  dst->push_back(kBlobRecord);
+  PutVarint64(dst, 0);
+  BlobHandle dummy;
+  dummy.EncodeTo(dst);
+}
+
+bool BlobIndex::IsDeletionMarker(const BlobIndex& index) {
+  return index.file_number == 0;
+}
+
+bool BlobIndex::operator==(const BlobIndex& rhs) const {
+  return (file_number == rhs.file_number && blob_handle == rhs.blob_handle);
+}
+
+void MergeBlobIndex::EncodeTo(std::string* dst) const {
+  BlobIndex::EncodeTo(dst);
+  PutVarint64(dst, source_file_number);
+  PutVarint64(dst, source_file_offset);
+}
+
+void MergeBlobIndex::EncodeToBase(std::string* dst) const {
+  BlobIndex::EncodeTo(dst);
+}
+
+Status MergeBlobIndex::DecodeFrom(Slice* src) {
+  Status s = BlobIndex::DecodeFrom(src);
+  if (!s.ok()) {
+    return s;
+  }
+  if (!GetVarint64(src, &source_file_number) ||
+      !GetVarint64(src, &source_file_offset)) {
+    return Status::Corruption("MergeBlobIndex");
+  }
+  return s;
+}
+
+Status MergeBlobIndex::DecodeFromBase(Slice* src) {
+  return BlobIndex::DecodeFrom(src);
+}
+
+bool MergeBlobIndex::operator==(const MergeBlobIndex& rhs) const {
+  return (source_file_number == rhs.source_file_number &&
+          source_file_offset == rhs.source_file_offset &&
+          BlobIndex::operator==(rhs));
 }
 
 void BlobFileMeta::EncodeTo(std::string* dst) const {
@@ -207,21 +245,16 @@ void BlobFileMeta::FileStateTransit(const FileEvent& event) {
       state_ = FileState::kBeingGC;
       break;
     case FileEvent::kGCOutput:
-      assert(state_ == FileState::kNone);
+      assert(state_ == FileState::kInit);
       state_ = FileState::kPendingGC;
       break;
     case FileEvent::kFlushOrCompactionOutput:
-      assert(state_ == FileState::kNone);
+      assert(state_ == FileState::kInit);
       state_ = FileState::kPendingLSM;
       break;
-    case FileEvent::kDbStart:
-      assert(state_ == FileState::kNone);
-      state_ = FileState::kPendingInit;
-      break;
-    case FileEvent::kDbInit:
-      if (state_ == FileState::kPendingInit) {
-        state_ = FileState::kNormal;
-      }
+    case FileEvent::kDbRestart:
+      assert(state_ == FileState::kInit);
+      state_ = FileState::kNormal;
       break;
     case FileEvent::kDelete:
       assert(state_ != FileState::kObsolete);
@@ -262,17 +295,6 @@ TitanInternalStats::StatsType BlobFileMeta::GetDiscardableRatioLevel() const {
     type = TitanInternalStats::NUM_DISCARDABLE_RATIO_LE100;
   }
   return type;
-}
-
-void BlobFileMeta::Dump(bool with_keys) const {
-  fprintf(stdout, "file %" PRIu64 ", size %" PRIu64 ", level %" PRIu32,
-          file_number_, file_size_, file_level_);
-  if (with_keys) {
-    fprintf(stdout, ", smallest key: %s, largest key: %s",
-            Slice(smallest_key_).ToString(true /*hex*/).c_str(),
-            Slice(largest_key_).ToString(true /*hex*/).c_str());
-  }
-  fprintf(stdout, "\n");
 }
 
 void BlobFileHeader::EncodeTo(std::string* dst) const {

@@ -54,8 +54,6 @@ class TitanGCStatsTest : public testing::Test {
     return s;
   }
 
-  void WaitGCInitialization() { db_impl_->thread_initialize_gc_->join(); }
-
   Status Close() {
     if (db_ == nullptr) {
       return Status::OK();
@@ -70,7 +68,6 @@ class TitanGCStatsTest : public testing::Test {
     Status s = Close();
     if (s.ok()) {
       s = Open();
-      WaitGCInitialization();
     }
     return s;
   }
@@ -111,7 +108,7 @@ class TitanGCStatsTest : public testing::Test {
 
   std::string gen_key(uint32_t key) const {
     char buf[kKeySize + 1];
-    snprintf(buf, kKeySize + 1, "%010u", key);
+    sprintf(buf, "%010u", key);
     return std::string(buf);
   }
 

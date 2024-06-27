@@ -1,10 +1,9 @@
 #pragma once
 
-#include "file/random_access_file_reader.h"
-
 #include "blob_format.h"
 #include "titan/options.h"
 #include "titan_stats.h"
+#include "util/file_reader_writer.h"
 
 namespace rocksdb {
 namespace titandb {
@@ -25,10 +24,10 @@ class BlobFileReader {
                      TitanStats* stats);
 
   // Gets the blob record pointed by the handle in this file. The data
-  // of the record is stored in the value slice underlying, so the value slice
+  // of the record is stored in the provided buffer, so the buffer
   // must be valid when the record is used.
   Status Get(const ReadOptions& options, const BlobHandle& handle,
-             BlobRecord* record, OwnedSlice* buffer);
+             BlobRecord* record, PinnableSlice* buffer);
 
  private:
   friend class BlobFilePrefetcher;
@@ -37,18 +36,19 @@ class BlobFileReader {
                  std::unique_ptr<RandomAccessFileReader> file,
                  TitanStats* stats);
 
-  static Status ReadHeader(std::unique_ptr<RandomAccessFileReader>& file,
-                           BlobFileHeader* header);
+  Status ReadRecord(const BlobHandle& handle, BlobRecord* record,
+                    OwnedSlice* buffer);
 
   TitanCFOptions options_;
   std::unique_ptr<RandomAccessFileReader> file_;
 
+  std::shared_ptr<Cache> cache_;
+  std::string cache_prefix_;
+
   // Information read from the file.
   BlobFileFooter footer_;
 
-  std::unique_ptr<UncompressionDict> uncompression_dict_ = nullptr;
-
-  // TitanStats* stats_;
+  TitanStats* stats_;
 };
 
 // Performs readahead on continuous reads.
@@ -59,7 +59,7 @@ class BlobFilePrefetcher : public Cleanable {
   BlobFilePrefetcher(BlobFileReader* reader) : reader_(reader) {}
 
   Status Get(const ReadOptions& options, const BlobHandle& handle,
-             BlobRecord* record, OwnedSlice* buffer);
+             BlobRecord* record, PinnableSlice* buffer);
 
  private:
   BlobFileReader* reader_;
@@ -67,14 +67,6 @@ class BlobFilePrefetcher : public Cleanable {
   uint64_t readahead_size_{0};
   uint64_t readahead_limit_{0};
 };
-
-// Init uncompression dictionary
-// called by BlobFileReader and BlobFileIterator when blob file has
-// uncompression dictionary
-Status InitUncompressionDict(
-    const BlobFileFooter& footer, RandomAccessFileReader* file,
-    std::unique_ptr<UncompressionDict>* uncompression_dict,
-    MemoryAllocator* allocator);
 
 }  // namespace titandb
 }  // namespace rocksdb

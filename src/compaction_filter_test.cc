@@ -26,9 +26,6 @@ class TestCompactionFilter : public CompactionFilter {
     if (key.ToString() == "bigkey") {
       ASSERT_EQ(value.ToString(), std::string(min_blob_size_ + 1, 'v'));
     }
-    if (key.starts_with("bigkey100")) {
-      ASSERT_EQ(key.size(), 100);
-    }
     if (key.starts_with("skip")) {
       ASSERT_EQ(value, Slice());
     }
@@ -138,14 +135,6 @@ TEST_F(TitanCompactionFilterTest, CompactBlobValue) {
   ASSERT_OK(s);
   ASSERT_EQ(value1, value);
 
-  char keybuf[1024] = {'\0'};
-  for (int i = 0; i < 1000; i++) {
-    memset(keybuf, 0, 1024);
-    snprintf(keybuf, 1024, "bigkey100_%090d", i);
-    s = Put(keybuf, value);
-    ASSERT_OK(s);
-  }
-
   CompactAll();
 
   s = Get("bigkey", &value1);
@@ -186,22 +175,6 @@ TEST_F(TitanCompactionFilterTest, CompactSkipValue) {
 
   std::string value;
   ASSERT_TRUE(db_->Get(ReadOptions(), "skip-key", &value).IsNotFound());
-}
-
-TEST_F(TitanCompactionFilterTest, FilterNewColumnFamily) {
-  options_.skip_value_in_compaction_filter = true;
-  Open();
-  TitanCFDescriptor desc("last_summer", options_);
-  ColumnFamilyHandle *handle = nullptr;
-  ASSERT_OK(db_->CreateColumnFamily(desc, &handle));
-
-  ASSERT_OK(db_->Put(WriteOptions(), handle, "skip-key", "skip-value"));
-  ASSERT_OK(db_->Flush(FlushOptions(), handle));
-  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), handle, nullptr, nullptr));
-
-  std::string value;
-  ASSERT_TRUE(db_->Get(ReadOptions(), handle, "skip-key", &value).IsNotFound());
-  ASSERT_OK(db_->DestroyColumnFamilyHandle(handle));
 }
 
 }  // namespace titandb

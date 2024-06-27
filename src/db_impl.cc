@@ -4,17 +4,7 @@
 #define __STDC_FORMAT_MACROS
 #endif
 
-#include <cinttypes>
-
-#include "db/arena_wrapped_db_iter.h"
-#include "logging/log_buffer.h"
-#include "monitoring/statistics_impl.h"
-#include "options/options_helper.h"
-#include "port/port.h"
-#include "util/autovector.h"
-#include "util/mutexlock.h"
-#include "util/string_util.h"
-#include "util/threadpool_imp.h"
+#include <inttypes.h>
 
 #include "base_db_listener.h"
 #include "blob_file_builder.h"
@@ -23,10 +13,14 @@
 #include "blob_gc.h"
 #include "compaction_filter.h"
 #include "db_iter.h"
+#include "logging/log_buffer.h"
+#include "monitoring/statistics_impl.h"
+#include "port/port.h"
 #include "table_factory.h"
 #include "titan_build_version.h"
-#include "titan_logging.h"
 #include "titan_stats.h"
+#include "util/autovector.h"
+#include "util/threadpool_imp.h"
 
 namespace rocksdb {
 namespace titandb {
@@ -35,22 +29,17 @@ class TitanDBImpl::FileManager : public BlobFileManager {
  public:
   FileManager(TitanDBImpl* db) : db_(db) {}
 
-  Status NewFile(std::unique_ptr<BlobFileHandle>* handle,
-                 Env::IOPriority pri) override {
+  Status NewFile(std::unique_ptr<BlobFileHandle>* handle) override {
     auto number = db_->blob_file_set_->NewFileNumber();
     auto name = BlobFileName(db_->dirname_, number);
 
     Status s;
     std::unique_ptr<WritableFileWriter> file;
     {
-      std::unique_ptr<FSWritableFile> f;
-      s = db_->env_->GetFileSystem()->NewWritableFile(
-          name, FileOptions(db_->env_options_), &f, nullptr /*dbg*/);
+      std::unique_ptr<WritableFile> f;
+      s = db_->env_->NewWritableFile(name, &f, db_->env_options_);
       if (!s.ok()) return s;
-
-      f->SetIOPriority(pri);
-      file.reset(new WritableFileWriter(std::move(f), name,
-                                        FileOptions(db_->env_options_)));
+      file.reset(new WritableFileWriter(std::move(f), name, db_->env_options_));
     }
 
     handle->reset(new FileHandle(number, name, std::move(file)));
@@ -67,15 +56,12 @@ class TitanDBImpl::FileManager : public BlobFileManager {
                                   std::unique_ptr<BlobFileHandle>>>& files)
       override {
     Status s;
-    if (files.empty()) return s;
-
     VersionEdit edit;
     edit.SetColumnFamilyID(cf_id);
     for (auto& file : files) {
       RecordTick(statistics(db_->stats_.get()), TITAN_BLOB_FILE_SYNCED);
       {
-        StopWatch sync_sw(db_->env_->GetSystemClock().get(),
-                          statistics(db_->stats_.get()),
+        StopWatch sync_sw(db_->env_, statistics(db_->stats_.get()),
                           TITAN_BLOB_FILE_SYNC_MICROS);
         s = file.second->GetFile()->Sync(false);
       }
@@ -84,7 +70,7 @@ class TitanDBImpl::FileManager : public BlobFileManager {
       }
       if (!s.ok()) return s;
 
-      TITAN_LOG_INFO(db_->db_options_.info_log,
+      ROCKS_LOG_INFO(db_->db_options_.info_log,
                      "Titan adding blob file [%" PRIu64 "] range [%s, %s]",
                      file.first->file_number(),
                      Slice(file.first->smallest_key()).ToString(true).c_str(),
@@ -156,15 +142,11 @@ TitanDBImpl::TitanDBImpl(const TitanDBOptions& options,
   }
   dirname_ = db_options_.dirname;
   if (db_options_.statistics != nullptr) {
-    // The point of `statistics` is that it can be shared by multiple instances.
-    // So we should check if it's a qualified statistics instead of overwriting
-    // it.
-    db_options_.statistics->getTickerCount(TITAN_TICKER_ENUM_MAX - 1);
-    HistogramData data;
-    db_options_.statistics->histogramData(TITAN_HISTOGRAM_ENUM_MAX - 1, &data);
+    db_options_.statistics = titandb::CreateDBStatistics();
     stats_.reset(new TitanStats(db_options_.statistics.get()));
   }
   blob_manager_.reset(new FileManager(this));
+  shared_merge_operator_ = std::make_shared<BlobIndexMergeOperator>();
 }
 
 TitanDBImpl::~TitanDBImpl() { Close(); }
@@ -173,15 +155,13 @@ void TitanDBImpl::StartBackgroundTasks() {
   if (thread_purge_obsolete_ == nullptr &&
       db_options_.purge_obsolete_files_period_sec > 0) {
     thread_purge_obsolete_.reset(new rocksdb::RepeatableThread(
-        [this]() { TitanDBImpl::PurgeObsoleteFiles(); }, "titanbg",
-        env_->GetSystemClock().get(),
+        [this]() { TitanDBImpl::PurgeObsoleteFiles(); }, "titanbg", env_,
         db_options_.purge_obsolete_files_period_sec * 1000 * 1000));
   }
   if (thread_dump_stats_ == nullptr &&
       db_options_.titan_stats_dump_period_sec > 0) {
     thread_dump_stats_.reset(new rocksdb::RepeatableThread(
-        [this]() { TitanDBImpl::DumpStats(); }, "titanst",
-        env_->GetSystemClock().get(),
+        [this]() { TitanDBImpl::DumpStats(); }, "titanst", env_,
         db_options_.titan_stats_dump_period_sec * 1000 * 1000));
   }
 }
@@ -213,7 +193,7 @@ Status TitanDBImpl::Open(const std::vector<TitanCFDescriptor>& descs,
       for (ColumnFamilyHandle* cfh : *handles) {
         Status destroy_handle_status = db_->DestroyColumnFamilyHandle(cfh);
         if (!destroy_handle_status.ok()) {
-          TITAN_LOG_ERROR(db_options_.info_log,
+          ROCKS_LOG_ERROR(db_options_.info_log,
                           "Failed to destroy CF handle after open failure: %s",
                           destroy_handle_status.ToString().c_str());
         }
@@ -223,7 +203,7 @@ Status TitanDBImpl::Open(const std::vector<TitanCFDescriptor>& descs,
     if (db_ != nullptr) {
       Status close_status = db_->Close();
       if (!close_status.ok()) {
-        TITAN_LOG_ERROR(db_options_.info_log,
+        ROCKS_LOG_ERROR(db_options_.info_log,
                         "Failed to close base DB after open failure: %s",
                         close_status.ToString().c_str());
       }
@@ -270,8 +250,7 @@ Status TitanDBImpl::OpenImpl(const std::vector<TitanCFDescriptor>& descs,
   // Note that info log is initialized after `CreateLoggerFromOptions`,
   // so new `BlobFileSet` here but not in constructor is to get a proper info
   // log.
-  blob_file_set_.reset(
-      new BlobFileSet(db_options_, stats_.get(), &initialized_, &mutex_));
+  blob_file_set_.reset(new BlobFileSet(db_options_, stats_.get()));
   // Setup options.
   db_options_.listeners.emplace_back(std::make_shared<BaseDbListener>(this));
   // Descriptors for actually open DB.
@@ -280,14 +259,15 @@ Status TitanDBImpl::OpenImpl(const std::vector<TitanCFDescriptor>& descs,
   for (auto& desc : descs) {
     base_descs.emplace_back(desc.name, desc.options);
     ColumnFamilyOptions& cf_opts = base_descs.back().options;
-    // Disable compactions before blob file set is initialized.
+    // Disable compactions before everything is initialized.
     cf_opts.disable_auto_compactions = true;
     cf_opts.table_properties_collector_factories.emplace_back(
         std::make_shared<BlobFileSizeCollectorFactory>());
     titan_table_factories.push_back(std::make_shared<TitanTableFactory>(
-        db_options_, desc.options, blob_manager_, &mutex_, blob_file_set_.get(),
-        stats_.get()));
+        db_options_, desc.options, this, blob_manager_, &mutex_,
+        blob_file_set_.get(), stats_.get()));
     cf_opts.table_factory = titan_table_factories.back();
+    cf_opts.merge_operator = shared_merge_operator_;
     if (cf_opts.compaction_filter != nullptr ||
         cf_opts.compaction_filter_factory != nullptr) {
       std::shared_ptr<TitanCompactionFilterFactory> titan_cf_factory =
@@ -328,45 +308,31 @@ Status TitanDBImpl::OpenImpl(const std::vector<TitanCFDescriptor>& descs,
                           descs[i].options.table_factory /*base_table_factory*/,
                           titan_table_factories[i]}));
     column_families[(*handles)[i]->GetID()] = descs[i].options;
-  }
-  s = blob_file_set_->Open(column_families, GenerateCachePrefix());
-  if (!s.ok()) {
-    return s;
-  }
-  for (size_t i = 0; i < handles->size(); i++) {
-    auto rocks_cf_handle =
-        static_cast_with_check<rocksdb::ColumnFamilyHandleImpl>((*handles)[i]);
-    auto titan_handle = new TitanColumnFamilyHandle(
-        rocks_cf_handle,
-        blob_file_set_->GetBlobStorage(rocks_cf_handle->GetID()).lock());
-    (*handles)[i] = titan_handle;
-    if ((*handles)[i]->GetName() == kDefaultColumnFamilyName) {
-      // New a separate handle for default column family, so default column
-      // family handle is always available even if caller delete the default
-      // column family handle.
-      default_cf_handle_ = new TitanColumnFamilyHandle(
-          rocks_cf_handle,
-          blob_file_set_->GetBlobStorage(rocks_cf_handle->GetID()).lock(),
-          false);
-    }
     if (!descs[i].options.disable_auto_compactions) {
-      cf_with_compaction.push_back(titan_handle);
+      cf_with_compaction.push_back((*handles)[i]);
     }
   }
-  s = AsyncInitializeGC(*handles);
+  s = blob_file_set_->Open(column_families);
   if (!s.ok()) {
     return s;
   }
-  // Enable compaction and background tasks after blob file set is opened.
-  db_->EnableAutoCompaction(cf_with_compaction);
+  s = InitializeGC(*handles);
+  TEST_SYNC_POINT_CALLBACK("TitanDBImpl::OpenImpl:BeforeInitialized", this);
+  // Initialization done.
+  initialized_ = true;
+  // Enable compaction and background tasks after initilization.
+  s = db_->EnableAutoCompaction(cf_with_compaction);
+  if (!s.ok()) {
+    return s;
+  }
   StartBackgroundTasks();
   // Dump options.
-  TITAN_LOG_INFO(db_options_.info_log, "Titan DB open.");
-  TITAN_LOG_HEADER(db_options_.info_log, "Titan git sha: %s",
+  ROCKS_LOG_INFO(db_options_.info_log, "Titan DB open.");
+  ROCKS_LOG_HEADER(db_options_.info_log, "Titan git sha: %s",
                    titan_build_git_sha);
   db_options_.Dump(db_options_.info_log.get());
   for (auto& desc : descs) {
-    TITAN_LOG_HEADER(db_options_.info_log,
+    ROCKS_LOG_HEADER(db_options_.info_log,
                      "Column family [%s], options:", desc.name.c_str());
     desc.options.Dump(db_options_.info_log.get());
   }
@@ -377,10 +343,6 @@ Status TitanDBImpl::Close() {
   Status s;
   CloseImpl();
   if (db_) {
-    if (default_cf_handle_ != nullptr) {
-      delete default_cf_handle_;
-      default_cf_handle_ = nullptr;
-    }
     s = db_->Close();
     delete db_;
     db_ = nullptr;
@@ -425,22 +387,6 @@ Status TitanDBImpl::CloseImpl() {
     mutex_.Unlock();
   }
 
-  if (thread_dump_stats_ != nullptr) {
-    thread_dump_stats_->cancel();
-    mutex_.Lock();
-    thread_dump_stats_.reset();
-    mutex_.Unlock();
-  }
-
-  if (thread_initialize_gc_ != nullptr) {
-    if (thread_initialize_gc_->joinable()) {
-      thread_initialize_gc_->join();
-    }
-    mutex_.Lock();
-    thread_initialize_gc_.reset();
-    mutex_.Unlock();
-  }
-
   return Status::OK();
 }
 
@@ -455,11 +401,14 @@ Status TitanDBImpl::CreateColumnFamilies(
     // Replaces the provided table factory with TitanTableFactory.
     base_table_factory.emplace_back(options.table_factory);
     titan_table_factory.emplace_back(std::make_shared<TitanTableFactory>(
-        db_options_, desc.options, blob_manager_, &mutex_, blob_file_set_.get(),
-        stats_.get()));
+        db_options_, desc.options, this, blob_manager_, &mutex_,
+        blob_file_set_.get(), stats_.get()));
     options.table_factory = titan_table_factory.back();
     options.table_properties_collector_factories.emplace_back(
         std::make_shared<BlobFileSizeCollectorFactory>());
+    options.merge_operator = shared_merge_operator_;
+    base_descs.emplace_back(desc.name, options);
+
     if (options.compaction_filter != nullptr ||
         options.compaction_filter_factory != nullptr) {
       std::shared_ptr<TitanCompactionFilterFactory> titan_cf_factory =
@@ -469,8 +418,6 @@ Status TitanDBImpl::CreateColumnFamilies(
       options.compaction_filter = nullptr;
       options.compaction_filter_factory = titan_cf_factory;
     }
-
-    base_descs.emplace_back(desc.name, options);
   }
 
   Status s = db_impl_->CreateColumnFamilies(base_descs, handles);
@@ -491,21 +438,12 @@ Status TitanDBImpl::CreateColumnFamilies(
                  MutableTitanCFOptions(descs[i].options), base_table_factory[i],
                  titan_table_factory[i]}));
       }
-      blob_file_set_->AddColumnFamilies(column_families, GenerateCachePrefix());
-      for (size_t i = 0; i < handles->size(); i++) {
-        auto rocks_cf_handle =
-            static_cast_with_check<rocksdb::ColumnFamilyHandleImpl>(
-                (*handles)[i]);
-        auto titan_handle = new TitanColumnFamilyHandle(
-            rocks_cf_handle,
-            blob_file_set_->GetBlobStorage(rocks_cf_handle->GetID()).lock());
-        (*handles)[i] = titan_handle;
-      }
+      blob_file_set_->AddColumnFamilies(column_families);
     }
   }
   if (s.ok()) {
     for (auto& desc : descs) {
-      TITAN_LOG_INFO(db_options_.info_log, "Created column family [%s].",
+      ROCKS_LOG_INFO(db_options_.info_log, "Created column family [%s].",
                      desc.name.c_str());
       desc.options.Dump(db_options_.info_log.get());
     }
@@ -514,7 +452,7 @@ Status TitanDBImpl::CreateColumnFamilies(
     for (auto& desc : descs) {
       column_families_str += "[" + desc.name + "]";
     }
-    TITAN_LOG_ERROR(db_options_.info_log,
+    ROCKS_LOG_ERROR(db_options_.info_log,
                     "Failed to create column families %s: %s",
                     column_families_str.c_str(), s.ToString().c_str());
   }
@@ -554,10 +492,10 @@ Status TitanDBImpl::DropColumnFamilies(
     }
   }
   if (s.ok()) {
-    TITAN_LOG_INFO(db_options_.info_log, "Dropped column families: %s",
+    ROCKS_LOG_INFO(db_options_.info_log, "Dropped column families: %s",
                    column_families_str.c_str());
   } else {
-    TITAN_LOG_ERROR(db_options_.info_log,
+    ROCKS_LOG_ERROR(db_options_.info_log,
                     "Failed to drop column families %s: %s",
                     column_families_str.c_str(), s.ToString().c_str());
   }
@@ -569,13 +507,8 @@ Status TitanDBImpl::DestroyColumnFamilyHandle(
   if (column_family == nullptr) {
     return Status::InvalidArgument("Column family handle is nullptr.");
   }
-
   auto cf_id = column_family->GetID();
-  auto cf_name = column_family->GetName();
-  if (column_family == default_cf_handle_) {
-    return Status::InvalidArgument(
-        "Default column family handle is not destroyable.");
-  }
+  std::string cf_name = column_family->GetName();
   Status s = db_impl_->DestroyColumnFamilyHandle(column_family);
 
   if (s.ok()) {
@@ -589,10 +522,10 @@ Status TitanDBImpl::DestroyColumnFamilyHandle(
     }
   }
   if (s.ok()) {
-    TITAN_LOG_INFO(db_options_.info_log, "Destroyed column family handle [%s].",
+    ROCKS_LOG_INFO(db_options_.info_log, "Destroyed column family handle [%s].",
                    cf_name.c_str());
   } else {
-    TITAN_LOG_ERROR(db_options_.info_log,
+    ROCKS_LOG_ERROR(db_options_.info_log,
                     "Failed to destroy column family handle [%s]: %s",
                     cf_name.c_str(), s.ToString().c_str());
   }
@@ -629,17 +562,14 @@ Status TitanDBImpl::Put(const rocksdb::WriteOptions& options,
 }
 
 Status TitanDBImpl::Write(const rocksdb::WriteOptions& options,
-                          rocksdb::WriteBatch* updates,
-                          PostWriteCallback* callback) {
-  return HasBGError() ? GetBGError() : db_->Write(options, updates, callback);
+                          rocksdb::WriteBatch* updates) {
+  return HasBGError() ? GetBGError() : db_->Write(options, updates);
 }
 
 Status TitanDBImpl::MultiBatchWrite(const WriteOptions& options,
-                                    std::vector<WriteBatch*>&& updates,
-                                    PostWriteCallback* callback) {
-  return HasBGError()
-             ? GetBGError()
-             : db_->MultiBatchWrite(options, std::move(updates), callback);
+                                    std::vector<WriteBatch*>&& updates) {
+  return HasBGError() ? GetBGError()
+                      : db_->MultiBatchWrite(options, std::move(updates));
 }
 
 Status TitanDBImpl::Delete(const rocksdb::WriteOptions& options,
@@ -686,45 +616,51 @@ Status TitanDBImpl::GetImpl(const ReadOptions& options,
                             PinnableSlice* value) {
   Status s;
   bool is_blob_index = false;
-  DBImpl::GetImplOptions gopts;
-  gopts.column_family = handle;
-  gopts.value = value;
-  gopts.is_blob_index = &is_blob_index;
-  s = db_impl_->GetImpl(options, key, gopts);
+  s = db_impl_->GetImpl(options, handle, key, value, nullptr /*value_found*/,
+                        nullptr /*read_callback*/, &is_blob_index);
   if (!s.ok() || !is_blob_index) return s;
 
-  StopWatch get_sw(env_->GetSystemClock().get(), statistics(stats_.get()),
-                   TITAN_GET_MICROS);
+  StopWatch get_sw(env_, statistics(stats_.get()), TITAN_GET_MICROS);
   RecordTick(statistics(stats_.get()), TITAN_NUM_GET);
 
   BlobIndex index;
   s = index.DecodeFrom(value);
   assert(s.ok());
   if (!s.ok()) return s;
+  if (BlobIndex::IsDeletionMarker(index)) {
+    return Status::NotFound("encounter deletion marker");
+  }
 
-  auto storage =
-      static_cast_with_check<TitanColumnFamilyHandle>(handle)->GetBlobStorage();
+  BlobRecord record;
+  PinnableSlice buffer;
+
+  mutex_.Lock();
+  auto storage = blob_file_set_->GetBlobStorage(handle->GetID()).lock();
+  mutex_.Unlock();
+
   if (storage) {
-    StopWatch read_sw(env_->GetSystemClock().get(), statistics(stats_.get()),
+    StopWatch read_sw(env_, statistics(stats_.get()),
                       TITAN_BLOB_FILE_READ_MICROS);
-    value->Reset();
-    BlobRecord record;
-    s = storage->Get(options, index, &record, value);
+    s = storage->Get(options, index, &record, &buffer);
     RecordTick(statistics(stats_.get()), TITAN_BLOB_FILE_NUM_KEYS_READ);
     RecordTick(statistics(stats_.get()), TITAN_BLOB_FILE_BYTES_READ,
                index.blob_handle.size);
   } else {
-    TITAN_LOG_ERROR(db_options_.info_log,
+    ROCKS_LOG_ERROR(db_options_.info_log,
                     "Column family id:%" PRIu32 " not Found.", handle->GetID());
     return Status::NotFound(
         "Column family id: " + std::to_string(handle->GetID()) + " not Found.");
   }
   if (s.IsCorruption()) {
-    TITAN_LOG_ERROR(db_options_.info_log,
+    ROCKS_LOG_ERROR(db_options_.info_log,
                     "Key:%s Snapshot:%" PRIu64 " GetBlobFile err:%s\n",
                     key.ToString(true).c_str(),
                     options.snapshot->GetSequenceNumber(),
                     s.ToString().c_str());
+  }
+  if (s.ok()) {
+    value->Reset();
+    value->PinSelf(record.value);
   }
   return s;
 }
@@ -732,10 +668,12 @@ Status TitanDBImpl::GetImpl(const ReadOptions& options,
 std::vector<Status> TitanDBImpl::MultiGet(
     const ReadOptions& options, const std::vector<ColumnFamilyHandle*>& handles,
     const std::vector<Slice>& keys, std::vector<std::string>* values) {
-  if (options.snapshot) {
-    return MultiGetImpl(options, handles, keys, values);
+  auto options_copy = options;
+  options_copy.total_order_seek = true;
+  if (options_copy.snapshot) {
+    return MultiGetImpl(options_copy, handles, keys, values);
   }
-  ReadOptions ro(options);
+  ReadOptions ro(options_copy);
   ManagedSnapshot snapshot(this);
   ro.snapshot = snapshot.snapshot();
   return MultiGetImpl(ro, handles, keys, values);
@@ -760,11 +698,13 @@ std::vector<Status> TitanDBImpl::MultiGetImpl(
 
 Iterator* TitanDBImpl::NewIterator(const TitanReadOptions& options,
                                    ColumnFamilyHandle* handle) {
+  TitanReadOptions options_copy = options;
+  options_copy.total_order_seek = true;
   std::shared_ptr<ManagedSnapshot> snapshot;
-  if (options.snapshot) {
-    return NewIteratorImpl(options, handle, snapshot);
+  if (options_copy.snapshot) {
+    return NewIteratorImpl(options_copy, handle, snapshot);
   }
-  TitanReadOptions ro(options);
+  TitanReadOptions ro(options_copy);
   snapshot.reset(new ManagedSnapshot(this));
   ro.snapshot = snapshot->snapshot();
   return NewIteratorImpl(ro, handle, snapshot);
@@ -775,22 +715,21 @@ Iterator* TitanDBImpl::NewIteratorImpl(
     std::shared_ptr<ManagedSnapshot> snapshot) {
   auto cfd = reinterpret_cast<ColumnFamilyHandleImpl*>(handle)->cfd();
 
-  auto storage =
-      static_cast_with_check<TitanColumnFamilyHandle>(handle)->GetBlobStorage();
+  mutex_.Lock();
+  auto storage = blob_file_set_->GetBlobStorage(handle->GetID()).lock();
+  mutex_.Unlock();
 
   if (!storage) {
-    TITAN_LOG_ERROR(db_options_.info_log,
+    ROCKS_LOG_ERROR(db_options_.info_log,
                     "Column family id:%" PRIu32 " not Found.", handle->GetID());
     return nullptr;
   }
 
   std::unique_ptr<ArenaWrappedDBIter> iter(db_impl_->NewIteratorImpl(
       options, cfd, options.snapshot->GetSequenceNumber(),
-      nullptr /*read_callback*/, true /*expose_blob_index*/,
-      true /*allow_refresh*/));
+      nullptr /*read_callback*/, true /*allow_blob*/, true /*allow_refresh*/));
   return new TitanDBIterator(options, storage.get(), snapshot, std::move(iter),
-                             env_->GetSystemClock().get(), stats_.get(),
-                             db_options_.info_log.get());
+                             env_, stats_.get(), db_options_.info_log.get());
 }
 
 Status TitanDBImpl::NewIterators(
@@ -798,6 +737,7 @@ Status TitanDBImpl::NewIterators(
     const std::vector<ColumnFamilyHandle*>& handles,
     std::vector<Iterator*>* iterators) {
   TitanReadOptions ro(options);
+  ro.total_order_seek = true;
   std::shared_ptr<ManagedSnapshot> snapshot;
   if (!ro.snapshot) {
     snapshot.reset(new ManagedSnapshot(this));
@@ -818,64 +758,6 @@ void TitanDBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
   // We can record here whether the oldest snapshot is released.
   // If not, we can just skip the next round of purging obsolete files.
   db_->ReleaseSnapshot(snapshot);
-}
-
-Status TitanDBImpl::DisableFileDeletions() {
-  // Disable base DB file deletions.
-  Status s = db_impl_->DisableFileDeletions();
-  if (!s.ok()) {
-    return s;
-  }
-
-  int count = 0;
-  {
-    // Hold delete_titandb_file_mutex_ to make sure no
-    // PurgeObsoleteFiles job is running.
-    MutexLock l(&delete_titandb_file_mutex_);
-    count = ++disable_titandb_file_deletions_;
-  }
-
-  TITAN_LOG_INFO(db_options_.info_log,
-                 "Disalbed blob file deletions. count: %d", count);
-  return Status::OK();
-}
-
-Status TitanDBImpl::EnableFileDeletions(bool force) {
-  // Enable base DB file deletions.
-  Status s = db_impl_->EnableFileDeletions(force);
-  if (!s.ok()) {
-    return s;
-  }
-
-  int count = 0;
-  {
-    MutexLock l(&delete_titandb_file_mutex_);
-    if (force) {
-      disable_titandb_file_deletions_ = 0;
-    } else if (disable_titandb_file_deletions_ > 0) {
-      count = --disable_titandb_file_deletions_;
-    }
-    assert(count >= 0);
-  }
-
-  TITAN_LOG_INFO(db_options_.info_log, "Enabled blob file deletions. count: %d",
-                 count);
-  return Status::OK();
-}
-
-Status TitanDBImpl::GetAllTitanFiles(std::vector<std::string>& files,
-                                     std::vector<VersionEdit>* edits) {
-  Status s = DisableFileDeletions();
-  if (!s.ok()) {
-    return s;
-  }
-
-  {
-    MutexLock l(&mutex_);
-    blob_file_set_->GetAllFiles(&files, edits);
-  }
-
-  return EnableFileDeletions(false);
 }
 
 Status TitanDBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
@@ -961,7 +843,7 @@ Status TitanDBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
         prop.second, false /*to_add*/, &blob_file_size_diff);
     if (!gc_stats_status.ok()) {
       // TODO: Should treat it as background error and make DB read-only.
-      TITAN_LOG_ERROR(db_options_.info_log,
+      ROCKS_LOG_ERROR(db_options_.info_log,
                       "failed to extract GC stats, file: %s, error: %s",
                       prop.first.c_str(), gc_stats_status.ToString().c_str());
       assert(false);
@@ -978,11 +860,10 @@ Status TitanDBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
   if (!s.ok()) return s;
 
   MutexLock l(&mutex_);
-  auto bs = static_cast_with_check<TitanColumnFamilyHandle>(column_family)
-                ->GetBlobStorage();
+  auto bs = blob_file_set_->GetBlobStorage(cf_id).lock();
   if (!bs) {
     // TODO: Should treat it as background error and make DB read-only.
-    TITAN_LOG_ERROR(db_options_.info_log,
+    ROCKS_LOG_ERROR(db_options_.info_log,
                     "Column family id:%" PRIu32 " not Found.", cf_id);
     return Status::NotFound("Column family id: " + std::to_string(cf_id) +
                             " not Found.");
@@ -994,27 +875,36 @@ Status TitanDBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
     uint64_t file_number = file_size.first;
     int64_t delta = file_size.second;
     auto file = bs->FindFile(file_number).lock();
-    if (!file || file->is_obsolete()) {
+    if (!file) {
       // file has been gc out
       continue;
     }
-    file->UpdateLiveDataSize(delta);
-    if (file->file_state() == BlobFileMeta::FileState::kPendingInit) {
-      // When uninitialized, only update the live data size.
-      continue;
+    if (!file->is_obsolete()) {
+      auto before = file->GetDiscardableRatioLevel();
+      bool ok = file->UpdateLiveDataSize(delta);
+      if (!ok) {
+        ROCKS_LOG_WARN(db_options_.info_log,
+                       "During DeleteFilesInRanges: blob file %" PRIu64
+                       " live size below zero.",
+                       file_number);
+        assert(false);
+      }
+      auto after = file->GetDiscardableRatioLevel();
+      if (before != after) {
+        AddStats(stats_.get(), cf_id, after, 1);
+        SubStats(stats_.get(), cf_id, before, 1);
+      }
     }
     if (cf_options.level_merge) {
       if (file->NoLiveData()) {
-        RecordTick(statistics(stats_.get()), TITAN_GC_NUM_FILES, 1);
-        RecordTick(statistics(stats_.get()), TITAN_GC_LEVEL_MERGE_DELETE, 1);
         edit.DeleteBlobFile(file->file_number(),
                             db_impl_->GetLatestSequenceNumber());
       } else if (file->GetDiscardableRatio() >
                  cf_options.blob_file_discardable_ratio) {
-        RecordTick(statistics(stats_.get()), TITAN_GC_LEVEL_MERGE_MARK, 1);
         file->FileStateTransit(BlobFileMeta::FileEvent::kNeedMerge);
       }
     }
+    SubStats(stats_.get(), cf_id, TitanInternalStats::LIVE_BLOB_SIZE, -delta);
   }
   if (cf_options.level_merge) {
     blob_file_set_->LogAndApply(edit);
@@ -1029,12 +919,12 @@ Status TitanDBImpl::DeleteFilesInRanges(ColumnFamilyHandle* column_family,
 }
 
 Status TitanDBImpl::DeleteBlobFilesInRanges(ColumnFamilyHandle* column_family,
-                                            const RangePtr* ranges, size_t n,
-                                            bool include_end) {
+                                        const RangePtr* ranges, size_t n,
+                                        bool include_end) {
   MutexLock l(&mutex_);
   SequenceNumber obsolete_sequence = db_impl_->GetLatestSequenceNumber();
-  Status s = blob_file_set_->DeleteBlobFilesInRanges(
-      column_family->GetID(), ranges, n, include_end, obsolete_sequence);
+  Status s = blob_file_set_->DeleteBlobFilesInRanges(column_family->GetID(), ranges, n, include_end,
+                                              obsolete_sequence);
   return s;
 }
 
@@ -1068,7 +958,6 @@ void TitanDBImpl::MarkFileIfNeedMerge(
       set.insert(end.first);
       if (set.size() > static_cast<size_t>(max_sorted_runs)) {
         for (auto file : set) {
-          RecordTick(statistics(stats_.get()), TITAN_GC_LEVEL_MERGE_MARK, 1);
           file->FileStateTransit(BlobFileMeta::FileEvent::kNeedMerge);
         }
       }
@@ -1087,7 +976,7 @@ Options TitanDBImpl::GetOptions(ColumnFamilyHandle* column_family) const {
   if (cf_info_.count(cf_id) > 0) {
     options.table_factory = cf_info_.at(cf_id).base_table_factory;
   } else {
-    TITAN_LOG_ERROR(
+    ROCKS_LOG_ERROR(
         db_options_.info_log,
         "Failed to get original table factory for column family %s.",
         column_family->GetName().c_str());
@@ -1096,75 +985,45 @@ Options TitanDBImpl::GetOptions(ColumnFamilyHandle* column_family) const {
   return options;
 }
 
-Status TitanDBImpl::ExtractTitanCfOptions(
-    ColumnFamilyHandle* column_family,
-    std::unordered_map<std::string, std::string>& new_options,
-    MutableTitanCFOptions& mutable_cf_options, bool& changed) {
-  for (auto it = new_options.begin(); it != new_options.end();) {
-    const std::string& name = it->first;
-    const std::string& value = it->second;
-    if (name == "blob_run_mode") {
-      auto run_mode_mapping_pos = blob_run_mode_string_map.find(value);
-      if (run_mode_mapping_pos == blob_run_mode_string_map.end()) {
-        return Status::InvalidArgument("No blob_run_mode defined for " + value);
-      } else {
-        mutable_cf_options.blob_run_mode = run_mode_mapping_pos->second;
-        TITAN_LOG_INFO(db_options_.info_log, "[%s] Set blob_run_mode: %s",
-                       column_family->GetName().c_str(), value.c_str());
-      }
-      it = new_options.erase(it);
-      changed = true;
-    } else if (name == "min_blob_size") {
-      uint64_t min_blob_size = ParseUint64(value);
-      mutable_cf_options.min_blob_size = min_blob_size;
-      TITAN_LOG_INFO(db_options_.info_log, "[%s] Set min_blob_size: %" PRIu64,
-                     column_family->GetName().c_str(), min_blob_size);
-      it = new_options.erase(it);
-      changed = true;
-    } else if (name == "blob_file_compression") {
-      auto compression_type_mapping_pos =
-          compression_type_string_map.find(value);
-      if (compression_type_mapping_pos == compression_type_string_map.end()) {
-        return Status::InvalidArgument("No compression type defined for " +
-                                       value);
-      } else {
-        mutable_cf_options.blob_file_compression =
-            compression_type_mapping_pos->second;
-        TITAN_LOG_INFO(db_options_.info_log,
-                       "[%s] Set blob_file_compression: %s",
-                       column_family->GetName().c_str(), value.c_str());
-      }
-      it = new_options.erase(it);
-      changed = true;
-    } else if (name == "blob_file_discardable_ratio") {
-      double blob_file_discardable_ratio = ParseDouble(value);
-      mutable_cf_options.blob_file_discardable_ratio =
-          blob_file_discardable_ratio;
-      TITAN_LOG_INFO(
-          db_options_.info_log, "[%s] Set blob_file_discardable_ratio: %f",
-          column_family->GetName().c_str(), blob_file_discardable_ratio);
-      it = new_options.erase(it);
-      changed = true;
-    } else {
-      ++it;
-    }
-  }
-
-  return Status::OK();
-}
-
 Status TitanDBImpl::SetOptions(
     ColumnFamilyHandle* column_family,
     const std::unordered_map<std::string, std::string>& new_options) {
   Status s;
   auto opts = new_options;
-  MutableTitanCFOptions mutable_cf_options =
-      cf_info_.at(column_family->GetID()).mutable_cf_options;
-  bool titan_options_changed = false;
-  s = ExtractTitanCfOptions(column_family, opts, mutable_cf_options,
-                            titan_options_changed);
-  if (!s.ok()) {
-    return s;
+  bool set_blob_run_mode = false;
+  TitanBlobRunMode blob_run_mode = TitanBlobRunMode::kNormal;
+  bool set_gc_merge_rewrite = false;
+  bool gc_merge_rewrite = false;
+  {
+    auto p = opts.find("blob_run_mode");
+    set_blob_run_mode = (p != opts.end());
+    if (set_blob_run_mode) {
+      const std::string& blob_run_mode_string = p->second;
+      auto pm = blob_run_mode_string_map.find(blob_run_mode_string);
+      if (pm == blob_run_mode_string_map.end()) {
+        return Status::InvalidArgument("No blob_run_mode defined for " +
+                                       blob_run_mode_string);
+      } else {
+        blob_run_mode = pm->second;
+        ROCKS_LOG_INFO(db_options_.info_log, "[%s] Set blob_run_mode: %s",
+                       column_family->GetName().c_str(),
+                       blob_run_mode_string.c_str());
+      }
+      opts.erase(p);
+    }
+  }
+  {
+    auto p = opts.find("gc_merge_rewrite");
+    set_gc_merge_rewrite = (p != opts.end());
+    if (set_gc_merge_rewrite) {
+      try {
+        gc_merge_rewrite = ParseBoolean("", p->second);
+      } catch (std::exception& e) {
+        return Status::InvalidArgument("Error parsing " + p->second + ":" +
+                                       std::string(e.what()));
+      }
+      opts.erase(p);
+    }
   }
   if (opts.size() > 0) {
     s = db_->SetOptions(column_family, opts);
@@ -1172,18 +1031,19 @@ Status TitanDBImpl::SetOptions(
       return s;
     }
   }
-  // Make sure base db's SetOptions success before setting Titan's.
-  if (titan_options_changed) {
+  // Make sure base db's SetOptions success before setting blob_run_mode.
+  if (set_blob_run_mode || set_gc_merge_rewrite) {
     uint32_t cf_id = column_family->GetID();
     {
       MutexLock l(&mutex_);
       assert(cf_info_.count(cf_id) > 0);
       TitanColumnFamilyInfo& cf_info = cf_info_[cf_id];
-      cf_info.titan_table_factory->SetMutableCFOptions(mutable_cf_options);
-      cf_info.mutable_cf_options = mutable_cf_options;
-      auto bs = blob_file_set_->GetBlobStorage(cf_id).lock();
-      if (bs != nullptr) {
-        bs->SetMutableCFOptions(mutable_cf_options);
+      if (set_blob_run_mode) {
+        cf_info.titan_table_factory->SetBlobRunMode(blob_run_mode);
+        cf_info.mutable_cf_options.blob_run_mode = blob_run_mode;
+      }
+      if (set_gc_merge_rewrite) {
+        cf_info.mutable_cf_options.gc_merge_rewrite = gc_merge_rewrite;
       }
     }
   }
@@ -1254,12 +1114,16 @@ bool TitanDBImpl::GetIntProperty(ColumnFamilyHandle* column_family,
 void TitanDBImpl::OnFlushCompleted(const FlushJobInfo& flush_job_info) {
   TEST_SYNC_POINT("TitanDBImpl::OnFlushCompleted:Begin1");
   TEST_SYNC_POINT("TitanDBImpl::OnFlushCompleted:Begin");
+  if (!initialized()) {
+    assert(false);
+    return;
+  }
   std::map<uint64_t, int64_t> blob_file_size_diff;
   Status s = ExtractGCStatsFromTableProperty(
       flush_job_info.table_properties, true /*to_add*/, &blob_file_size_diff);
   if (!s.ok()) {
     // TODO: Should treat it as background error and make DB read-only.
-    TITAN_LOG_ERROR(db_options_.info_log,
+    ROCKS_LOG_ERROR(db_options_.info_log,
                     "OnFlushCompleted[%d]: failed to extract GC stats: %s",
                     flush_job_info.job_id, s.ToString().c_str());
     assert(false);
@@ -1271,7 +1135,7 @@ void TitanDBImpl::OnFlushCompleted(const FlushJobInfo& flush_job_info) {
         blob_file_set_->GetBlobStorage(flush_job_info.cf_id).lock();
     if (!blob_storage) {
       // TODO: Should treat it as background error and make DB read-only.
-      TITAN_LOG_ERROR(db_options_.info_log,
+      ROCKS_LOG_ERROR(db_options_.info_log,
                       "OnFlushCompleted[%d]: Column family id: %" PRIu32
                       " Not Found.",
                       flush_job_info.job_id, flush_job_info.cf_id);
@@ -1286,10 +1150,17 @@ void TitanDBImpl::OnFlushCompleted(const FlushJobInfo& flush_job_info) {
       if (file == nullptr) {
         continue;
       }
-
+      if (file->file_state() != BlobFileMeta::FileState::kPendingLSM) {
+        // This file may be output of a GC job.
+        ROCKS_LOG_INFO(db_options_.info_log,
+                       "OnFlushCompleted[%d]: ignore GC output file %" PRIu64
+                       ".",
+                       flush_job_info.job_id, file->file_number());
+        continue;
+      }
       if (delta < 0) {
         // Cannot happen..
-        TITAN_LOG_WARN(db_options_.info_log,
+        ROCKS_LOG_WARN(db_options_.info_log,
                        "OnFlushCompleted[%d]: New blob file %" PRIu64
                        " live size being negative",
                        flush_job_info.job_id, file_number);
@@ -1297,27 +1168,28 @@ void TitanDBImpl::OnFlushCompleted(const FlushJobInfo& flush_job_info) {
         delta = 0;
       }
 
-      if (file->file_state() == BlobFileMeta::FileState::kPendingInit) {
-        continue;
+      if (file->live_data_size() != 0) {
+        // Because the flushed SST is added to superversion before
+        // `OnFlushCompleted()` is called, so if there is a concurrent
+        // compaction, `OnCompactionCompleted()` maybe called before
+        // `OnFlushCompleted()` is called.
+        // In this case, the state of the blob file generated by the flush is
+        // still `kPendingLSM`, while the blob file size delta is for the
+        // compaction event. So it is possible that delta is negative.
+        // It records the delta as a positive number if any, so here subtract it
+        // from the total live data size.
+        delta -= file->live_data_size();
       }
-
-      if (file->file_state() != BlobFileMeta::FileState::kPendingLSM) {
-        // This file may be output of a GC job.
-        TITAN_LOG_INFO(db_options_.info_log,
-                       "OnFlushCompleted[%d]: ignore GC output file %" PRIu64
-                       ".",
-                       flush_job_info.job_id, file->file_number());
-      } else {
-        // No need to set live data size here, because it's already set in
-        // table builder
-        file->FileStateTransit(BlobFileMeta::FileEvent::kFlushCompleted);
-        TITAN_LOG_INFO(db_options_.info_log,
-                       "OnFlushCompleted[%d]: output blob file %" PRIu64
-                       ","
-                       " live data size %" PRIu64 ".",
-                       flush_job_info.job_id, file->file_number(),
-                       file->live_data_size());
-      }
+      file->set_live_data_size(static_cast<uint64_t>(delta));
+      AddStats(stats_.get(), flush_job_info.cf_id,
+               file->GetDiscardableRatioLevel(), 1);
+      file->FileStateTransit(BlobFileMeta::FileEvent::kFlushCompleted);
+      ROCKS_LOG_INFO(db_options_.info_log,
+                     "OnFlushCompleted[%d]: output blob file %" PRIu64
+                     ","
+                     " live data size %" PRIu64 ".",
+                     flush_job_info.job_id, file->file_number(),
+                     file->live_data_size());
     }
   }
   TEST_SYNC_POINT("TitanDBImpl::OnFlushCompleted:Finished");
@@ -1326,6 +1198,10 @@ void TitanDBImpl::OnFlushCompleted(const FlushJobInfo& flush_job_info) {
 void TitanDBImpl::OnCompactionCompleted(
     const CompactionJobInfo& compaction_job_info) {
   TEST_SYNC_POINT("TitanDBImpl::OnCompactionCompleted:Begin");
+  if (!initialized()) {
+    assert(false);
+    return;
+  }
   if (!compaction_job_info.status.ok()) {
     // TODO: Clean up blob file generated by the failed compaction.
     return;
@@ -1337,7 +1213,7 @@ void TitanDBImpl::OnCompactionCompleted(
     for (const auto& file_name : files) {
       auto prop_iter = prop_collection.find(file_name);
       if (prop_iter == prop_collection.end()) {
-        TITAN_LOG_WARN(
+        ROCKS_LOG_WARN(
             db_options_.info_log,
             "OnCompactionCompleted[%d]: No table properties for file %s.",
             compaction_job_info.job_id, file_name.c_str());
@@ -1347,12 +1223,12 @@ void TitanDBImpl::OnCompactionCompleted(
           prop_iter->second, to_add, &blob_file_size_diff);
       if (!gc_stats_status.ok()) {
         // TODO: Should treat it as background error and make DB read-only.
-        TITAN_LOG_ERROR(db_options_.info_log,
-                        "OnCompactionCompleted[%d]: failed to extract GC "
-                        "stats from table "
-                        "property: compaction file: %s, error: %s",
-                        compaction_job_info.job_id, file_name.c_str(),
-                        gc_stats_status.ToString().c_str());
+        ROCKS_LOG_ERROR(
+            db_options_.info_log,
+            "OnCompactionCompleted[%d]: failed to extract GC stats from table "
+            "property: compaction file: %s, error: %s",
+            compaction_job_info.job_id, file_name.c_str(),
+            gc_stats_status.ToString().c_str());
         assert(false);
       }
     }
@@ -1365,20 +1241,18 @@ void TitanDBImpl::OnCompactionCompleted(
     auto bs = blob_file_set_->GetBlobStorage(compaction_job_info.cf_id).lock();
     if (!bs) {
       // TODO: Should treat it as background error and make DB read-only.
-      TITAN_LOG_ERROR(db_options_.info_log,
+      ROCKS_LOG_ERROR(db_options_.info_log,
                       "OnCompactionCompleted[%d] Column family id:%" PRIu32
                       " not Found.",
                       compaction_job_info.job_id, compaction_job_info.cf_id);
       return;
     }
-
     VersionEdit edit;
     auto cf_options = bs->cf_options();
     std::vector<std::shared_ptr<BlobFileMeta>> to_merge_candidates;
     bool count_sorted_run =
         cf_options.level_merge && cf_options.range_merge &&
         cf_options.num_levels - 1 == compaction_job_info.output_level;
-
     for (const auto& file_diff : blob_file_size_diff) {
       uint64_t file_number = file_diff.first;
       int64_t delta = file_diff.second;
@@ -1387,74 +1261,101 @@ void TitanDBImpl::OnCompactionCompleted(
         // File has been GC out.
         continue;
       }
-
-      if (file->file_state() == BlobFileMeta::FileState::kPendingInit) {
-        // When uninitialized, only update the live data size.
-        file->UpdateLiveDataSize(delta);
-        continue;
-      }
-
       if (file->file_state() == BlobFileMeta::FileState::kPendingLSM) {
-        // Because the new generated SST is added to superversion before
-        // `OnFlushCompleted()`/`OnCompactionCompleted()` is called, so if
-        // there is a later compaction trigger by the new generated SST, the
-        // later `OnCompactionCompleted()` maybe called before the previous
-        // events' `OnFlushCompleted()`/`OnCompactionCompleted()` is called.
-        // In this case, the state of the blob file generated by the
-        // flush/compaction is still `kPendingLSM`, while the blob file size
-        // delta is for the later compaction event, and it is possible that
-        // delta is negative.
-        // If the delta is positive, it means the blob file is the output of
-        // the compaction and the live data size is already in table builder.
-        // So here only update live data size when negative.
-        if (delta < 0) {
-          file->UpdateLiveDataSize(delta);
+        if (delta <= 0) {
+          // Because the new generated SST is added to superversion before
+          // `OnFlushCompleted()`/`OnCompactionCompleted()` is called, so if
+          // there is a later compaction trigger by the new generated SST, the
+          // later `OnCompactionCompleted()` maybe called before the previous
+          // events' `OnFlushCompleted()`/`OnCompactionCompleted()` is called.
+          // In this case, the state of the blob file generated by the
+          // flush/compaction is still `kPendingLSM`, while the blob file size
+          // delta is for the later compaction event. So it is possible that
+          // delta is negative.
+          // To make the live data size accurate, here records the delta as a
+          // positive number. And the delta will be subtracted with total live
+          // data size in the previous
+          // `OnFlushCompleted()`/`OnCompactionCompleted()`.
+          bool ok = file->UpdateLiveDataSize(static_cast<uint64_t>(-delta));
+          if (!ok) {
+            // Cannot happen
+            ROCKS_LOG_WARN(
+                db_options_.info_log,
+                "OnCompactionCompleted[%d]: pendingLSM Blob file %" PRIu64
+                " live size below zero.",
+                compaction_job_info.job_id, file_number);
+            assert(false);
+          }
+          ROCKS_LOG_INFO(db_options_.info_log,
+                         "OnCompactionCompleted[%d]: Get blob file %" PRIu64
+                         " live size being negative, maybe due to "
+                         "OnFlushCompleted() is called yet",
+                         compaction_job_info.job_id, file_number);
+          continue;
         }
+        if (file->live_data_size() != 0) {
+          // It records the delta as a positive number if any later compaction
+          // is trigger before previous `OnCompactionCompleted()` is called, so
+          // here subtract it
+          // from the total live data size.
+          delta -= file->live_data_size();
+        }
+        file->set_live_data_size(static_cast<uint64_t>(delta));
+        AddStats(stats_.get(), compaction_job_info.cf_id,
+                 file->GetDiscardableRatioLevel(), 1);
         file->FileStateTransit(BlobFileMeta::FileEvent::kCompactionCompleted);
-        if (file->NoLiveData()) {
-          RecordTick(statistics(stats_.get()), TITAN_GC_NUM_FILES, 1);
-          RecordTick(statistics(stats_.get()), TITAN_GC_LEVEL_MERGE_DELETE, 1);
-          edit.DeleteBlobFile(file->file_number(),
-                              db_impl_->GetLatestSequenceNumber());
-        }
         to_merge_candidates.push_back(file);
-        TITAN_LOG_INFO(
+        ROCKS_LOG_INFO(
             db_options_.info_log,
             "OnCompactionCompleted[%d]: compaction output blob file %" PRIu64
-            ", live data size %" PRIu64 ", discardable ratio %lf.",
+            ", live data size %" PRIu64 ".",
             compaction_job_info.job_id, file->file_number(),
-            file->live_data_size(), file->GetDiscardableRatio());
+            file->live_data_size());
       } else if (file->file_state() == BlobFileMeta::FileState::kNormal ||
                  file->file_state() == BlobFileMeta::FileState::kToMerge) {
         if (delta > 0) {
           assert(false);
-          TITAN_LOG_WARN(db_options_.info_log,
+          ROCKS_LOG_WARN(db_options_.info_log,
                          "OnCompactionCompleted[%d]: Blob file %" PRIu64
                          " live size increase after compaction.",
                          compaction_job_info.job_id, file_number);
         }
-        file->UpdateLiveDataSize(delta);
+        auto before = file->GetDiscardableRatioLevel();
+        SubStats(stats_.get(), compaction_job_info.cf_id, before, 1);
+        bool ok = file->UpdateLiveDataSize(delta);
+        if (!ok) {
+          ROCKS_LOG_WARN(db_options_.info_log,
+                         "OnCompactionCompleted[%d]: Blob file %" PRIu64
+                         " live size below zero.",
+                         compaction_job_info.job_id, file_number);
+          assert(false);
+        }
+        SubStats(stats_.get(), compaction_job_info.cf_id,
+                 TitanInternalStats::LIVE_BLOB_SIZE, delta);
         if (cf_options.level_merge) {
-          // After level merge, most entries of merged blob files are written
-          // to new blob files. Delete blob files which have no live data.
+          // After level merge, most entries of merged blob files are written to
+          // new blob files. Delete blob files which have no live data.
           // Mark last two level blob files to merge in next compaction if
           // discardable size reached GC threshold
           if (file->NoLiveData()) {
-            RecordTick(statistics(stats_.get()), TITAN_GC_NUM_FILES, 1);
-            RecordTick(statistics(stats_.get()), TITAN_GC_LEVEL_MERGE_DELETE,
-                       1);
             edit.DeleteBlobFile(file->file_number(),
                                 db_impl_->GetLatestSequenceNumber());
           } else if (static_cast<int>(file->file_level()) >=
                          cf_options.num_levels - 2 &&
                      file->GetDiscardableRatio() >
                          cf_options.blob_file_discardable_ratio) {
-            RecordTick(statistics(stats_.get()), TITAN_GC_LEVEL_MERGE_MARK, 1);
             file->FileStateTransit(BlobFileMeta::FileEvent::kNeedMerge);
-          } else if (count_sorted_run) {
-            to_merge_candidates.push_back(file);
+          } else {
+            if (count_sorted_run) {
+              to_merge_candidates.push_back(file);
+            }
           }
         }
+      }
+      if (file->file_state() == BlobFileMeta::FileState::kNormal ||
+          file->file_state() == BlobFileMeta::FileState::kToMerge) {
+        auto after = file->GetDiscardableRatioLevel();
+        AddStats(stats_.get(), compaction_job_info.cf_id, after, 1);
       }
     }
     // If level merge is enabled, blob files will be deleted by live
@@ -1499,7 +1400,7 @@ void TitanDBImpl::DumpStats() {
     for (auto& cf : cf_info_) {
       TitanInternalStats* internal_stats = stats_->internal_stats(cf.first);
       if (internal_stats == nullptr) {
-        TITAN_LOG_WARN(db_options_.info_log,
+        ROCKS_LOG_WARN(db_options_.info_log,
                        "Column family [%s] missing internal stats.",
                        cf.second.name.c_str());
         continue;
@@ -1510,17 +1411,6 @@ void TitanDBImpl::DumpStats() {
     }
   }
   log_buffer.FlushBufferToLog();
-}
-
-std::string TitanDBImpl::GenerateCachePrefix() {
-  std::string cache_prefix;
-  // Unlike block-based table, which have per-table cache prefix, we use
-  // the same cache prefix for all blob files for blob cache.
-  assert(directory_ != nullptr);
-  char buffer[kMaxVarint64Length * 3 + 1];
-  size_t size = directory_->GetUniqueId(buffer, sizeof(buffer));
-  cache_prefix.assign(buffer, size);
-  return cache_prefix;
 }
 
 }  // namespace titandb

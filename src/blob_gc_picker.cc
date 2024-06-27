@@ -4,9 +4,7 @@
 #define __STDC_FORMAT_MACROS
 #endif
 
-#include <cinttypes>
-
-#include "titan_logging.h"
+#include <inttypes.h>
 
 namespace rocksdb {
 namespace titandb {
@@ -28,33 +26,20 @@ std::unique_ptr<BlobGC> BasicBlobGCPicker::PickBlobGC(
   bool stop_picking = false;
   bool maybe_continue_next_time = false;
   uint64_t next_gc_size = 0;
-  bool in_fallback = cf_options_.blob_run_mode == TitanBlobRunMode::kFallback;
-
   for (auto& gc_score : blob_storage->gc_score()) {
     if (gc_score.score < cf_options_.blob_file_discardable_ratio) {
       break;
     }
-    // in fallback mode, only gc files that all blobs are discarded
-    if (in_fallback && std::abs(1.0 - gc_score.score) >
-                           std::numeric_limits<double>::epsilon()) {
-      break;
-    }
-
     auto blob_file = blob_storage->FindFile(gc_score.file_number).lock();
     if (!CheckBlobFile(blob_file.get())) {
       // Skip this file id this file is being GCed
       // or this file had been GCed
-      TITAN_LOG_INFO(db_options_.info_log, "Blob file %" PRIu64 " no need gc",
+      ROCKS_LOG_INFO(db_options_.info_log, "Blob file %" PRIu64 " no need gc",
                      blob_file->file_number());
       continue;
     }
     if (!stop_picking) {
       blob_files.emplace_back(blob_file);
-      if (blob_file->file_size() <= cf_options_.merge_small_file_threshold) {
-        RecordTick(statistics(stats_), TITAN_GC_SMALL_FILE, 1);
-      } else {
-        RecordTick(statistics(stats_), TITAN_GC_DISCARDABLE, 1);
-      }
       batch_size += blob_file->file_size();
       estimate_output_size += blob_file->live_data_size();
       if (batch_size >= cf_options_.max_gc_batch_size ||
@@ -65,10 +50,10 @@ std::unique_ptr<BlobGC> BasicBlobGCPicker::PickBlobGC(
       }
     } else {
       next_gc_size += blob_file->file_size();
-      if (next_gc_size > cf_options_.min_gc_batch_size || in_fallback) {
+      if (next_gc_size > cf_options_.min_gc_batch_size) {
         maybe_continue_next_time = true;
         RecordTick(statistics(stats_), TITAN_GC_REMAIN, 1);
-        TITAN_LOG_INFO(db_options_.info_log,
+        ROCKS_LOG_INFO(db_options_.info_log,
                        "remain more than %" PRIu64
                        " bytes to be gc and trigger after this gc",
                        next_gc_size);
@@ -76,27 +61,21 @@ std::unique_ptr<BlobGC> BasicBlobGCPicker::PickBlobGC(
       }
     }
   }
-  TITAN_LOG_DEBUG(db_options_.info_log,
+  ROCKS_LOG_DEBUG(db_options_.info_log,
                   "got batch size %" PRIu64 ", estimate output %" PRIu64
                   " bytes",
                   batch_size, estimate_output_size);
-
-  if (blob_files.empty()) return nullptr;
-
-  // Skip these checks if in fallback mode, we need to gc all files in fallback
-  // mode
-  if (!in_fallback) {
-    if (batch_size < cf_options_.min_gc_batch_size &&
-        estimate_output_size < cf_options_.blob_file_target_size) {
-      return nullptr;
-    }
-    // if there is only one small file to merge, no need to perform
-    if (blob_files.size() == 1 &&
-        blob_files[0]->file_size() <= cf_options_.merge_small_file_threshold &&
-        blob_files[0]->GetDiscardableRatio() <
-            cf_options_.blob_file_discardable_ratio) {
-      return nullptr;
-    }
+  if (blob_files.empty() ||
+      (batch_size < cf_options_.min_gc_batch_size &&
+       estimate_output_size < cf_options_.blob_file_target_size)) {
+    return nullptr;
+  }
+  // if there is only one small file to merge, no need to perform
+  if (blob_files.size() == 1 &&
+      blob_files[0]->file_size() <= cf_options_.merge_small_file_threshold &&
+      blob_files[0]->GetDiscardableRatio() <
+          cf_options_.blob_file_discardable_ratio) {
+    return nullptr;
   }
 
   return std::unique_ptr<BlobGC>(new BlobGC(
@@ -105,7 +84,7 @@ std::unique_ptr<BlobGC> BasicBlobGCPicker::PickBlobGC(
 
 bool BasicBlobGCPicker::CheckBlobFile(BlobFileMeta* blob_file) const {
   assert(blob_file == nullptr ||
-         blob_file->file_state() != BlobFileMeta::FileState::kNone);
+         blob_file->file_state() != BlobFileMeta::FileState::kInit);
   if (blob_file == nullptr ||
       blob_file->file_state() != BlobFileMeta::FileState::kNormal)
     return false;

@@ -1,8 +1,7 @@
-#include "blob_gc_job.h"
-
 #include "rocksdb/convenience.h"
 #include "test_util/testharness.h"
 
+#include "blob_gc_job.h"
 #include "blob_gc_picker.h"
 #include "db_impl.h"
 
@@ -23,7 +22,7 @@ std::string GenValue(int i) {
   return buffer;
 }
 
-class BlobGCJobTest : public testing::Test {
+class BlobGCJobTest : public testing::TestWithParam<bool /*gc_merge_mode*/> {
  public:
   std::string dbname_;
   TitanDB* db_;
@@ -42,6 +41,7 @@ class BlobGCJobTest : public testing::Test {
     options_.env->CreateDirIfMissing(dbname_);
     options_.env->CreateDirIfMissing(options_.dirname);
   }
+
   ~BlobGCJobTest() { Close(); }
 
   void DisableMergeSmall() { options_.merge_small_file_threshold = 0; }
@@ -79,8 +79,6 @@ class BlobGCJobTest : public testing::Test {
     Open();
   }
 
-  void WaitGCInitialization() { tdb_->thread_initialize_gc_->join(); }
-
   void Open() {
     ASSERT_OK(TitanDB::Open(options_, dbname_, &db_));
     tdb_ = reinterpret_cast<TitanDBImpl*>(db_);
@@ -92,7 +90,6 @@ class BlobGCJobTest : public testing::Test {
   void Reopen() {
     Close();
     Open();
-    WaitGCInitialization();
   }
 
   void ScheduleRangeMerge(
@@ -145,6 +142,7 @@ class BlobGCJobTest : public testing::Test {
       cf_options.merge_small_file_threshold = 0;
     }
     cf_options.blob_file_discardable_ratio = 0.4;
+    cf_options.sample_file_size_ratio = 1;
 
     std::unique_ptr<BlobGC> blob_gc;
     {
@@ -160,7 +158,7 @@ class BlobGCJobTest : public testing::Test {
       blob_gc->SetColumnFamily(cfh);
 
       BlobGCJob blob_gc_job(blob_gc.get(), base_db_, mutex_, tdb_->db_options_,
-                            tdb_->env_, EnvOptions(options_),
+                            GetParam(), tdb_->env_, EnvOptions(options_),
                             tdb_->blob_manager_.get(), blob_file_set_,
                             &log_buffer, nullptr, nullptr);
 
@@ -219,8 +217,8 @@ class BlobGCJobTest : public testing::Test {
     BlobGC blob_gc(std::move(tmp), TitanCFOptions(), false /*trigger_next*/);
     blob_gc.SetColumnFamily(cfh);
     BlobGCJob blob_gc_job(&blob_gc, base_db_, mutex_, TitanDBOptions(),
-                          Env::Default(), EnvOptions(), nullptr, blob_file_set_,
-                          nullptr, nullptr, nullptr);
+                          GetParam(), Env::Default(), EnvOptions(), nullptr,
+                          blob_file_set_, nullptr, nullptr, nullptr);
     bool discardable = false;
     ASSERT_OK(blob_gc_job.DiscardEntry(key, blob_index, &discardable));
     ASSERT_FALSE(discardable);
@@ -283,11 +281,11 @@ class BlobGCJobTest : public testing::Test {
   }
 };
 
-TEST_F(BlobGCJobTest, DiscardEntry) { TestDiscardEntry(); }
+TEST_P(BlobGCJobTest, DiscardEntry) { TestDiscardEntry(); }
 
-TEST_F(BlobGCJobTest, RunGC) { TestRunGC(); }
+TEST_P(BlobGCJobTest, RunGC) { TestRunGC(); }
 
-TEST_F(BlobGCJobTest, GCLimiter) {
+TEST_P(BlobGCJobTest, GCLimiter) {
   class TestLimiter : public RateLimiter {
    public:
     TestLimiter(RateLimiter::Mode mode)
@@ -296,8 +294,7 @@ TEST_F(BlobGCJobTest, GCLimiter) {
     size_t RequestToken(size_t bytes, size_t alignment,
                         Env::IOPriority io_priority, Statistics* stats,
                         RateLimiter::OpType op_type) override {
-      // Just the same condition with the rocksdb's RequestToken
-      if (io_priority < Env::IO_TOTAL && IsRateLimited(op_type)) {
+      if (IsRateLimited(op_type)) {
         if (op_type == RateLimiter::OpType::kRead) {
           read = true;
         } else {
@@ -380,7 +377,7 @@ TEST_F(BlobGCJobTest, GCLimiter) {
   Close();
 }
 
-TEST_F(BlobGCJobTest, Reopen) {
+TEST_P(BlobGCJobTest, Reopen) {
   DisableMergeSmall();
   NewDB();
   for (int i = 0; i < 10; i++) {
@@ -407,7 +404,7 @@ TEST_F(BlobGCJobTest, Reopen) {
 
 // Tests blob file will be kept after GC, if it is still visible by active
 // snapshots.
-TEST_F(BlobGCJobTest, PurgeBlobs) {
+TEST_P(BlobGCJobTest, PurgeBlobs) {
   NewDB();
 
   auto snap1 = db_->GetSnapshot();
@@ -462,56 +459,7 @@ TEST_F(BlobGCJobTest, PurgeBlobs) {
   CheckBlobNumber(1);
 }
 
-TEST_F(BlobGCJobTest, GCWhileDeleteFilesInRange) {
-  NewDB();
-
-  for (int i = 0; i < MAX_KEY_NUM; i++) {
-    db_->Put(WriteOptions(), GenKey(i), GenValue(i));
-  }
-  Flush();
-  std::string result;
-  for (int i = 0; i < MAX_KEY_NUM; i++) {
-    db_->Delete(WriteOptions(), GenKey(i));
-  }
-  Flush();
-  CompactAll();
-
-  rocksdb::SyncPoint::GetInstance()->LoadDependency({
-      {"BlobGCJob::Finish::BeforeDeleteInputBlobFiles",
-       "BlobGCJobTest::GCWhileDeleteFilesInRange:Wait"},
-      {"BlobFileSet::LogAndApply::Wait",
-       "BlobGCJobTest::GCWhileDeleteFilesInRange:1"},
-      {"BlobGCJobTest::GCWhileDeleteFilesInRange:2",
-       "BlobFileSet::LogAndApply::AfterSyncTitanManifest"},
-  });
-  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
-
-  rocksdb::port::Thread t1([&]() { RunGC(true); });
-  rocksdb::port::Thread t2([&]() {
-    TEST_SYNC_POINT("BlobGCJobTest::GCWhileDeleteFilesInRange:Wait");
-    RangePtr range(nullptr, nullptr);
-    ASSERT_OK(
-        db_->DeleteBlobFilesInRanges(db_->DefaultColumnFamily(), &range, 1));
-  });
-
-  // Wait until both `RunGC` and `DeleteBlobFilesInRanges` are processing in
-  // `LogAndApply`
-  TEST_SYNC_POINT("BlobGCJobTest::GCWhileDeleteFilesInRange:1");
-  std::this_thread::sleep_for(std::chrono::seconds(1));
-  TEST_SYNC_POINT("BlobGCJobTest::GCWhileDeleteFilesInRange:2");
-  t1.join();
-  t2.join();
-
-  Reopen();
-
-  TitanReadOptions opts;
-  auto* iter = db_->NewIterator(opts, db_->DefaultColumnFamily());
-  iter->SeekToFirst();
-  ASSERT_FALSE(iter->Valid());
-  delete iter;
-}
-
-TEST_F(BlobGCJobTest, DeleteFilesInRange) {
+TEST_P(BlobGCJobTest, DeleteFilesInRange) {
   NewDB();
 
   ASSERT_OK(db_->Put(WriteOptions(), GenKey(2), GenValue(21)));
@@ -582,16 +530,13 @@ TEST_F(BlobGCJobTest, DeleteFilesInRange) {
   // with 0 blob file
 
   TitanReadOptions opts;
-  opts.abort_on_failure = false;
   auto* iter = db_->NewIterator(opts, db_->DefaultColumnFamily());
   iter->SeekToFirst();
   while (iter->Valid()) {
-    iter->value();
-    if (!iter->Valid()) break;
     iter->Next();
   }
   // `DeleteFilesInRange` may expose old blob index.
-  ASSERT_FALSE(iter->status().ok());
+  ASSERT_TRUE(iter->status().IsCorruption());
   delete iter;
 
   // Set key only to ignore the stale blob indexes.
@@ -605,7 +550,7 @@ TEST_F(BlobGCJobTest, DeleteFilesInRange) {
   delete iter;
 }
 
-TEST_F(BlobGCJobTest, LevelMergeGC) {
+TEST_P(BlobGCJobTest, LevelMergeGC) {
   options_.level_merge = true;
   options_.level_compaction_dynamic_level_bytes = true;
   options_.blob_file_discardable_ratio = 0.5;
@@ -656,7 +601,7 @@ TEST_F(BlobGCJobTest, LevelMergeGC) {
             BlobFileMeta::FileState::kNormal);
 }
 
-TEST_F(BlobGCJobTest, RangeMergeScheduler) {
+TEST_P(BlobGCJobTest, RangeMergeScheduler) {
   NewDB();
   auto init_files =
       [&](std::vector<std::vector<std::pair<std::string, std::string>>>
@@ -827,7 +772,7 @@ TEST_F(BlobGCJobTest, RangeMergeScheduler) {
   }
 }
 
-TEST_F(BlobGCJobTest, RangeMerge) {
+TEST_P(BlobGCJobTest, RangeMerge) {
   options_.level_merge = true;
   options_.level_compaction_dynamic_level_bytes = true;
   options_.blob_file_discardable_ratio = 0.5;
@@ -877,6 +822,9 @@ TEST_F(BlobGCJobTest, RangeMerge) {
     ASSERT_EQ(file->file_state(), BlobFileMeta::FileState::kObsolete);
   }
 }
+
+INSTANTIATE_TEST_CASE_P(BlobGCJobTestParameterized, BlobGCJobTest,
+                        ::testing::Values(false, true));
 }  // namespace titandb
 
 }  // namespace rocksdb

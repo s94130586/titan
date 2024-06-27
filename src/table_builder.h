@@ -1,11 +1,11 @@
 #pragma once
 
 #include "rocksdb/types.h"
-#include "table/table_builder.h"
 
 #include "blob_file_builder.h"
 #include "blob_file_manager.h"
 #include "blob_file_set.h"
+#include "table/table_builder.h"
 #include "titan/options.h"
 #include "titan_stats.h"
 
@@ -46,28 +46,12 @@ class TitanTableBuilder : public TableBuilder {
 
   TableProperties GetTableProperties() const override;
 
-  IOStatus io_status() const override;
-
-  std::string GetFileChecksum() const override;
-
-  const char* GetFileChecksumFuncName() const override;
-
  private:
   friend class TableBuilderTest;
 
   bool ok() const { return status().ok(); }
 
-  bool builder_unbuffered() const {
-    return !blob_builder_ || blob_builder_->GetBuilderState() ==
-                                 BlobFileBuilder::BuilderState::kUnbuffered;
-  }
-
-  std::unique_ptr<BlobFileBuilder::BlobRecordContext> NewCachedRecordContext(
-      const ParsedInternalKey& ikey, const Slice& value);
-
-  void AddBlob(const ParsedInternalKey& ikey, const Slice& value);
-
-  void AddBlobResultsToBase(const BlobFileBuilder::OutContexts& contexts);
+  void AddBlob(const Slice& key, const Slice& value, std::string* index_value);
 
   bool ShouldMerge(const std::shared_ptr<BlobFileMeta>& file);
 
@@ -76,10 +60,7 @@ class TitanTableBuilder : public TableBuilder {
   void UpdateInternalOpStats();
 
   Status GetBlobRecord(const BlobIndex& index, BlobRecord* record,
-                       OwnedSlice* buffer);
-
-  void AddBase(const Slice& key, const ParsedInternalKey& parsedKey,
-               const Slice& value);
+                       PinnableSlice* buffer);
 
   Status status_;
   uint32_t cf_id_;
@@ -109,8 +90,6 @@ class TitanTableBuilder : public TableBuilder {
   uint64_t bytes_written_ = 0;
   uint64_t io_bytes_read_ = 0;
   uint64_t io_bytes_written_ = 0;
-  uint64_t gc_num_keys_relocated_ = 0;
-  uint64_t gc_bytes_relocated_ = 0;
   uint64_t error_read_cnt_ = 0;
 };
 

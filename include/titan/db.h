@@ -1,13 +1,10 @@
 #pragma once
 
 #include "rocksdb/utilities/stackable_db.h"
-
 #include "titan/options.h"
 
 namespace rocksdb {
 namespace titandb {
-
-class VersionEdit;
 
 struct TitanCFDescriptor {
   std::string name;
@@ -111,23 +108,6 @@ class TitanDB : public StackableDB {
     return Status::NotSupported("TitanDB doesn't support this operation");
   }
 
-  using StackableDB::DisableFileDeletions;
-  Status DisableFileDeletions() override {
-    return Status::NotSupported("TitanDB doesn't support this operation");
-  }
-
-  using StackableDB::EnableFileDeletions;
-  Status EnableFileDeletions(bool /*force*/) override {
-    return Status::NotSupported("TitanDB doesn't support this operation");
-  }
-
-  // Get all files in /titandb directory after disable file deletions
-  // edits include all blob file records of every column family
-  virtual Status GetAllTitanFiles(std::vector<std::string>& /*files*/,
-                                  std::vector<VersionEdit>* /*edits*/) {
-    return Status::NotSupported("TitanDB doesn't support this operation");
-  }
-
   using rocksdb::StackableDB::SingleDelete;
   Status SingleDelete(const WriteOptions& /*wopts*/,
                       ColumnFamilyHandle* /*column_family*/,
@@ -149,8 +129,8 @@ class TitanDB : public StackableDB {
                                      bool include_end = true) = 0;
 
   virtual Status DeleteBlobFilesInRanges(ColumnFamilyHandle* column_family,
-                                         const RangePtr* ranges, size_t n,
-                                         bool include_end = true) = 0;
+                                     const RangePtr* ranges, size_t n,
+                                     bool include_end = true) = 0;
 
   using rocksdb::StackableDB::GetOptions;
   Options GetOptions(ColumnFamilyHandle* column_family) const override = 0;

@@ -3,8 +3,8 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
+#include "rocksdb/types.h"
 #include "table/format.h"
-
 #include "util.h"
 
 namespace rocksdb {
@@ -61,32 +61,15 @@ struct BlobRecord {
 
 class BlobEncoder {
  public:
-  BlobEncoder(CompressionType compression, CompressionOptions compression_opt,
-              const CompressionDict* compression_dict)
-      : compression_opt_(compression_opt),
-        compression_ctx_(compression),
-        compression_dict_(compression_dict),
-        compression_info_(new CompressionInfo(
-            compression_opt_, compression_ctx_, *compression_dict_, compression,
-            0 /*sample_for_compression*/)) {}
-  BlobEncoder(CompressionType compression)
-      : BlobEncoder(compression, CompressionOptions(),
-                    &CompressionDict::GetEmptyDict()) {}
   BlobEncoder(CompressionType compression,
-              const CompressionDict* compression_dict)
-      : BlobEncoder(compression, CompressionOptions(), compression_dict) {}
-  BlobEncoder(CompressionType compression, CompressionOptions compression_opt)
-      : BlobEncoder(compression, compression_opt,
-                    &CompressionDict::GetEmptyDict()) {}
+              const CompressionDict& compression_dict)
+      : compression_ctx_(compression),
+        compression_info_(compression_opt_, compression_ctx_, compression_dict,
+                          compression, 0 /*sample_for_compression*/) {}
+  BlobEncoder(CompressionType compression)
+      : BlobEncoder(compression, CompressionDict::GetEmptyDict()) {}
 
   void EncodeRecord(const BlobRecord& record);
-  void EncodeSlice(const Slice& record);
-  void SetCompressionDict(const CompressionDict* compression_dict) {
-    compression_dict_ = compression_dict;
-    compression_info_.reset(new CompressionInfo(
-        compression_opt_, compression_ctx_, *compression_dict_,
-        compression_info_->type(), compression_info_->SampleForCompression()));
-  }
 
   Slice GetHeader() const { return Slice(header_, sizeof(header_)); }
   Slice GetRecord() const { return record_; }
@@ -100,26 +83,17 @@ class BlobEncoder {
   std::string compressed_buffer_;
   CompressionOptions compression_opt_;
   CompressionContext compression_ctx_;
-  const CompressionDict* compression_dict_;
-  std::unique_ptr<CompressionInfo> compression_info_;
+  CompressionInfo compression_info_;
 };
 
 class BlobDecoder {
  public:
-  BlobDecoder(const UncompressionDict* uncompression_dict,
-              CompressionType compression = kNoCompression)
-      : compression_(compression), uncompression_dict_(uncompression_dict) {}
-
-  BlobDecoder()
-      : BlobDecoder(&UncompressionDict::GetEmptyDict(), kNoCompression) {}
+  BlobDecoder(const UncompressionDict& uncompression_dict)
+      : uncompression_dict_(uncompression_dict) {}
+  BlobDecoder() : BlobDecoder(UncompressionDict::GetEmptyDict()) {}
 
   Status DecodeHeader(Slice* src);
-  Status DecodeRecord(Slice* src, BlobRecord* record, OwnedSlice* buffer,
-                      MemoryAllocator* allocator = nullptr);
-
-  void SetUncompressionDict(const UncompressionDict* uncompression_dict) {
-    uncompression_dict_ = uncompression_dict;
-  }
+  Status DecodeRecord(Slice* src, BlobRecord* record, OwnedSlice* buffer);
 
   size_t GetRecordSize() const { return record_size_; }
 
@@ -128,7 +102,7 @@ class BlobDecoder {
   uint32_t header_crc_{0};
   uint32_t record_size_{0};
   CompressionType compression_{kNoCompression};
-  const UncompressionDict* uncompression_dict_;
+  const UncompressionDict& uncompression_dict_;
 };
 
 // Format of blob handle (not fixed size):
@@ -166,10 +140,26 @@ struct BlobIndex {
   uint64_t file_number{0};
   BlobHandle blob_handle;
 
+  virtual ~BlobIndex() {}
+
   void EncodeTo(std::string* dst) const;
   Status DecodeFrom(Slice* src);
+  static void EncodeDeletionMarkerTo(std::string* dst);
+  static bool IsDeletionMarker(const BlobIndex& index);
 
-  friend bool operator==(const BlobIndex& lhs, const BlobIndex& rhs);
+  bool operator==(const BlobIndex& rhs) const;
+};
+
+struct MergeBlobIndex : public BlobIndex {
+  uint64_t source_file_number{0};
+  uint64_t source_file_offset{0};
+
+  void EncodeTo(std::string* dst) const;
+  void EncodeToBase(std::string* dst) const;
+  Status DecodeFrom(Slice* src);
+  Status DecodeFromBase(Slice* src);
+
+  bool operator==(const MergeBlobIndex& rhs) const;
 };
 
 // Format of blob file meta (not fixed size):
@@ -186,7 +176,7 @@ struct BlobIndex {
 //    +--------------------+--------------------+
 //
 // The blob file meta is stored in Titan's manifest for quick constructing of
-// meta informations of all the blob files in memory.
+// meta infomations of all the blob files in memory.
 //
 // Legacy format:
 //
@@ -199,22 +189,21 @@ struct BlobIndex {
 class BlobFileMeta {
  public:
   enum class FileEvent : int {
-    kDbStart,
-    kDbInit,
+    kInit,
     kFlushCompleted,
     kCompactionCompleted,
     kGCCompleted,
     kGCBegin,
     kGCOutput,
     kFlushOrCompactionOutput,
+    kDbRestart,
     kDelete,
     kNeedMerge,
     kReset,  // reset file to normal for test
   };
 
   enum class FileState : int {
-    kNone,         // just after created
-    kPendingInit,  // file is not async initialized yet
+    kInit,  // file never at this state
     kNormal,
     kPendingLSM,  // waiting keys adding to LSM
     kBeingGC,     // being gced
@@ -249,22 +238,23 @@ class BlobFileMeta {
   const std::string& smallest_key() const { return smallest_key_; }
   const std::string& largest_key() const { return largest_key_; }
 
-  void set_live_data_size(int64_t size) { live_data_size_ = size; }
+  void set_live_data_size(uint64_t size) { live_data_size_ = size; }
   uint64_t file_entries() const { return file_entries_; }
   FileState file_state() const { return state_; }
   bool is_obsolete() const { return state_ == FileState::kObsolete; }
 
   void FileStateTransit(const FileEvent& event);
-  void UpdateLiveDataSize(int64_t delta) { live_data_size_ += delta; }
-  bool NoLiveData() {
-    if (state_ == FileState::kPendingInit || state_ == FileState::kNone) {
-      // File is not initialized yet, so the live_data_size is not accurate now.
+  bool UpdateLiveDataSize(int64_t delta) {
+    int64_t result = static_cast<int64_t>(live_data_size_) + delta;
+    if (result < 0) {
+      live_data_size_ = 0;
       return false;
     }
-    return live_data_size_ == 0;
+    live_data_size_ = static_cast<uint64_t>(result);
+    return true;
   }
+  bool NoLiveData() { return live_data_size_ == 0; }
   double GetDiscardableRatio() const {
-    assert(state_ != FileState::kPendingInit);
     if (file_size_ == 0) {
       return 0;
     }
@@ -273,7 +263,6 @@ class BlobFileMeta {
                 (file_size_ - kBlobMaxHeaderSize - kBlobFooterSize));
   }
   TitanInternalStats::StatsType GetDiscardableRatioLevel() const;
-  void Dump(bool with_keys) const;
 
  private:
   // Persistent field
@@ -300,8 +289,8 @@ class BlobFileMeta {
   // So when state_ == kPendingLSM, it uses this to record the delta as a
   // positive number if any later compaction is trigger before previous
   // `OnCompactionCompleted()` is called.
-  std::atomic<int64_t> live_data_size_{0};
-  std::atomic<FileState> state_{FileState::kNone};
+  std::atomic<uint64_t> live_data_size_{0};
+  std::atomic<FileState> state_{FileState::kInit};
 };
 
 // Format of blob file header for version 1 (8 bytes):
@@ -337,14 +326,6 @@ struct BlobFileHeader {
   uint32_t version = kVersion2;
   uint32_t flags = 0;
 
-  static Status ValidateVersion(uint32_t ver) {
-    if (ver != BlobFileHeader::kVersion1 && ver != BlobFileHeader::kVersion2) {
-      return Status::InvalidArgument("unrecognized blob file version " +
-                                     ToString(ver));
-    }
-    return Status::OK();
-  }
-
   uint64_t size() const {
     return version == BlobFileHeader::kVersion1
                ? BlobFileHeader::kMinEncodedLength
@@ -372,6 +353,10 @@ struct BlobFileFooter {
 
   BlockHandle meta_index_handle{BlockHandle::NullBlockHandle()};
 
+  // Points to a uncompression dictionary (which is also pointed to by the meta
+  // index) when `kHasUncompressionDictionary` is set in the header.
+  BlockHandle uncompression_dict_handle{BlockHandle::NullBlockHandle()};
+
   void EncodeTo(std::string* dst) const;
   Status DecodeFrom(Slice* src);
 
@@ -380,12 +365,11 @@ struct BlobFileFooter {
 
 // A convenient template to decode a const slice.
 template <typename T>
-Status DecodeInto(const Slice& src, T* target,
-                  bool ignore_extra_bytes = false) {
-  Slice tmp = src;
-  Status s = target->DecodeFrom(&tmp);
-  if (!ignore_extra_bytes && s.ok() && !tmp.empty()) {
-    s = Status::Corruption("redundant bytes when decoding blob file");
+Status DecodeInto(const Slice& src, T* target) {
+  auto tmp = src;
+  auto s = target->DecodeFrom(&tmp);
+  if (s.ok() && !tmp.empty()) {
+    s = Status::Corruption(Slice());
   }
   return s;
 }

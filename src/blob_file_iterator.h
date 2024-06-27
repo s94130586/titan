@@ -1,17 +1,15 @@
 #pragma once
 
 #include <cstdint>
-
 #include <queue>
 
-#include "file/random_access_file_reader.h"
+#include "blob_format.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "table/internal_iterator.h"
-
-#include "blob_format.h"
 #include "titan/options.h"
 #include "util.h"
+#include "util/file_reader_writer.h"
 
 namespace rocksdb {
 namespace titandb {
@@ -60,9 +58,7 @@ class BlobFileIterator {
   Status status_;
   bool valid_{false};
 
-  std::unique_ptr<UncompressionDict> uncompression_dict_;
   BlobDecoder decoder_;
-
   uint64_t iterate_offset_{0};
   std::vector<char> buffer_;
   OwnedSlice uncompressed_;

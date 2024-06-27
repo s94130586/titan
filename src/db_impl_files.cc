@@ -1,17 +1,10 @@
 #include "db_impl.h"
-#include "titan_logging.h"
 
 namespace rocksdb {
 namespace titandb {
 
 Status TitanDBImpl::PurgeObsoleteFilesImpl() {
   Status s;
-
-  MutexLock delete_file_lock(&delete_titandb_file_mutex_);
-  if (disable_titandb_file_deletions_ > 0) {
-    return s;
-  }
-
   std::vector<std::string> candidate_files;
   auto oldest_sequence = GetOldestSnapshotSequence();
   {
@@ -27,12 +20,12 @@ Status TitanDBImpl::PurgeObsoleteFilesImpl() {
       candidate_files.end());
 
   for (const auto& candidate_file : candidate_files) {
-    TITAN_LOG_INFO(db_options_.info_log, "Titan deleting obsolete file [%s]",
+    ROCKS_LOG_INFO(db_options_.info_log, "Titan deleting obsolete file [%s]",
                    candidate_file.c_str());
     Status delete_status = env_->DeleteFile(candidate_file);
     if (!s.ok()) {
       // Move on despite error deleting the file.
-      TITAN_LOG_ERROR(db_options_.info_log,
+      ROCKS_LOG_ERROR(db_options_.info_log,
                       "Titan deleting file [%s] failed, status:%s",
                       candidate_file.c_str(), s.ToString().c_str());
       s = delete_status;

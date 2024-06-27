@@ -1,11 +1,10 @@
 #pragma once
 
+#include "blob_file_set.h"
+#include "db_impl.h"
 #include "rocksdb/listener.h"
 #include "rocksdb/table_properties.h"
 #include "util/coding.h"
-
-#include "blob_file_set.h"
-#include "db_impl.h"
 
 namespace rocksdb {
 namespace titandb {

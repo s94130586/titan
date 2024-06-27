@@ -2,13 +2,11 @@
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
 #endif
-#include <cinttypes>
-
-#include "rocksdb/options.h"
-
+#include <inttypes.h>
 #include "blob_file_cache.h"
 #include "blob_format.h"
 #include "blob_gc.h"
+#include "rocksdb/options.h"
 #include "titan_stats.h"
 
 namespace rocksdb {
@@ -18,23 +16,26 @@ namespace titandb {
 // column family.
 class BlobStorage {
  public:
+  BlobStorage(const BlobStorage& bs) : destroyed_(false) {
+    this->files_ = bs.files_;
+    this->file_cache_ = bs.file_cache_;
+    this->db_options_ = bs.db_options_;
+    this->cf_options_ = bs.cf_options_;
+    this->cf_id_ = bs.cf_id_;
+    this->stats_ = bs.stats_;
+  }
+
   BlobStorage(const TitanDBOptions& _db_options,
               const TitanCFOptions& _cf_options, uint32_t cf_id,
-              const std::string& cache_prefix,
-              std::shared_ptr<BlobFileCache> _file_cache, TitanStats* stats,
-              std::atomic<bool>* initialized)
+              std::shared_ptr<BlobFileCache> _file_cache, TitanStats* stats)
       : db_options_(_db_options),
         cf_options_(_cf_options),
-        mutable_cf_options_(_cf_options),
         cf_id_(cf_id),
         levels_file_count_(_cf_options.num_levels, 0),
         blob_ranges_(InternalComparator(_cf_options.comparator)),
-        cache_prefix_(cache_prefix),
-        blob_cache_(_cf_options.blob_cache),
         file_cache_(_file_cache),
         destroyed_(false),
-        stats_(stats),
-        initialized_(initialized) {}
+        stats_(stats) {}
 
   ~BlobStorage() {
     for (auto& file : files_) {
@@ -44,60 +45,37 @@ class BlobStorage {
 
   const TitanDBOptions& db_options() { return db_options_; }
 
-  TitanCFOptions cf_options() {
-    auto _cf_options = cf_options_;
-    _cf_options.UpdateMutableOptions(mutable_cf_options_);
-    return _cf_options;
-  }
+  const TitanCFOptions& cf_options() { return cf_options_; }
 
   const std::vector<GCScore> gc_score() {
     MutexLock l(&mutex_);
     return gc_score_;
   }
 
-  Cache* blob_cache() { return blob_cache_.get(); }
-
   // Gets the blob record pointed by the blob index. The provided
   // buffer is used to store the record data, so the buffer must be
   // valid when the record is used.
   Status Get(const ReadOptions& options, const BlobIndex& index,
-             BlobRecord* record, PinnableSlice* value);
-
-  // Gets the blob record pointed by the blob index by blob cache.
-  // The provided buffer is used to store the record data, so the buffer must be
-  // valid when the record is used.
-  // If cache hit, set cache_hit to true, otherwise false.
-  Status TryGetBlobCache(const std::string& cache_key, BlobRecord* record,
-                         PinnableSlice* value, bool* cache_hit);
-
-  std::string EncodeBlobCache(const BlobIndex& index);
+             BlobRecord* record, PinnableSlice* buffer);
 
   // Creates a prefetcher for the specified file number.
   Status NewPrefetcher(uint64_t file_number,
                        std::unique_ptr<BlobFilePrefetcher>* result);
 
   // Get all the blob files within the ranges.
-  Status GetBlobFilesInRanges(
-      const RangePtr* ranges, size_t n, bool include_end,
-      std::vector<std::shared_ptr<BlobFileMeta>>* files);
+  Status GetBlobFilesInRanges(const RangePtr* ranges, size_t n,
+                              bool include_end, std::vector<uint64_t>* files);
 
   // Finds the blob file meta for the specified file number. It is a
   // corruption if the file doesn't exist.
   std::weak_ptr<BlobFileMeta> FindFile(uint64_t file_number) const;
 
-  void StartInitializeAllFiles() {
-    MutexLock l(&mutex_);
-    for (auto& file : files_) {
-      file.second->FileStateTransit(BlobFileMeta::FileEvent::kDbStart);
-    }
-  }
-
   // Must call before TitanDBImpl initialized.
   void InitializeAllFiles() {
-    MutexLock l(&mutex_);
     for (auto& file : files_) {
-      file.second->FileStateTransit(BlobFileMeta::FileEvent::kDbInit);
+      file.second->FileStateTransit(BlobFileMeta::FileEvent::kDbRestart);
     }
+    ComputeGCScore();
   }
 
   // The corresponding column family is dropped, so mark destroyed and we can
@@ -116,9 +94,6 @@ class BlobStorage {
   // Computes GC score.
   void ComputeGCScore();
 
-  // Collects and updates statistics.
-  void UpdateStats();
-
   // Add a new blob file to this blob storage.
   void AddBlobFile(std::shared_ptr<BlobFileMeta>& file);
 
@@ -128,9 +103,6 @@ class BlobStorage {
   // returned again.
   void GetObsoleteFiles(std::vector<std::string>* obsolete_files,
                         SequenceNumber oldest_sequence);
-
-  // Gets all files (start with '/titandb' prefix), including obsolete files.
-  void GetAllFiles(std::vector<std::string>* files);
 
   // Mark the file as obsolete, and retrun value indicates whether the file is
   // founded.
@@ -142,7 +114,7 @@ class BlobStorage {
     return files_.size();
   }
 
-  uint64_t NumBlobFilesAtLevel(int level) const {
+  int NumBlobFilesAtLevel(int level) const {
     MutexLock l(&mutex_);
     if (level >= static_cast<int>(levels_file_count_.size())) {
       return 0;
@@ -161,11 +133,6 @@ class BlobStorage {
   void ExportBlobFiles(
       std::map<uint64_t, std::weak_ptr<BlobFileMeta>>& ret) const;
 
-  void SetMutableCFOptions(const MutableTitanCFOptions& options) {
-    MutexLock l(&mutex_);
-    mutable_cf_options_ = options;
-  }
-
  private:
   friend class BlobFileSet;
   friend class VersionTest;
@@ -179,15 +146,14 @@ class BlobStorage {
 
   TitanDBOptions db_options_;
   TitanCFOptions cf_options_;
-  MutableTitanCFOptions mutable_cf_options_;
-  const uint32_t cf_id_;
+  uint32_t cf_id_;
 
   mutable port::Mutex mutex_;
 
   // Only BlobStorage OWNS BlobFileMeta
   // file_number -> file_meta
   std::unordered_map<uint64_t, std::shared_ptr<BlobFileMeta>> files_;
-  std::vector<uint64_t> levels_file_count_;
+  std::vector<int> levels_file_count_;
 
   class InternalComparator {
    public:
@@ -208,8 +174,6 @@ class BlobStorage {
   std::multimap<const Slice, std::shared_ptr<BlobFileMeta>, InternalComparator>
       blob_ranges_;
 
-  const std::string cache_prefix_;
-  std::shared_ptr<Cache> blob_cache_;
   std::shared_ptr<BlobFileCache> file_cache_;
 
   std::vector<GCScore> gc_score_;
@@ -221,9 +185,6 @@ class BlobStorage {
   bool destroyed_;
 
   TitanStats* stats_;
-
-  // Indicates whether the files' live data size is initialized.
-  std::atomic<bool>* initialized_;
 };
 
 }  // namespace titandb

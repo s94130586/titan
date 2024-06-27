@@ -1,7 +1,6 @@
-#include "blob_format.h"
-
 #include "test_util/testharness.h"
 
+#include "blob_format.h"
 #include "testutil.h"
 #include "util.h"
 
@@ -50,17 +49,15 @@ TEST(BlobFormatTest, BlobFileFooter) {
 
 TEST(BlobFormatTest, BlobFileStateTransit) {
   BlobFileMeta blob_file;
-  ASSERT_EQ(blob_file.file_state(), BlobFileMeta::FileState::kNone);
-  blob_file.FileStateTransit(BlobFileMeta::FileEvent::kDbStart);
-  ASSERT_EQ(blob_file.file_state(), BlobFileMeta::FileState::kPendingInit);
-  blob_file.FileStateTransit(BlobFileMeta::FileEvent::kDbInit);
+  ASSERT_EQ(blob_file.file_state(), BlobFileMeta::FileState::kInit);
+  blob_file.FileStateTransit(BlobFileMeta::FileEvent::kDbRestart);
   ASSERT_EQ(blob_file.file_state(), BlobFileMeta::FileState::kNormal);
   blob_file.FileStateTransit(BlobFileMeta::FileEvent::kGCBegin);
   ASSERT_EQ(blob_file.file_state(), BlobFileMeta::FileState::kBeingGC);
   blob_file.FileStateTransit(BlobFileMeta::FileEvent::kGCCompleted);
 
   BlobFileMeta compaction_output;
-  ASSERT_EQ(compaction_output.file_state(), BlobFileMeta::FileState::kNone);
+  ASSERT_EQ(compaction_output.file_state(), BlobFileMeta::FileState::kInit);
   compaction_output.FileStateTransit(
       BlobFileMeta::FileEvent::kFlushOrCompactionOutput);
   ASSERT_EQ(compaction_output.file_state(),
@@ -102,10 +99,8 @@ std::string CreateDict() {
   BlobEncoder encoder(kZSTD);
 
   for (int i = 0; i < sample_count; ++i) {
-    std::string key = "key" + std::to_string(i);
-    std::string value = "value" + std::to_string(i);
-    record.key = Slice(key);
-    record.value = Slice(value);
+    record.key = "key" + std::to_string(i);
+    record.value = "value" + std::to_string(i);
     encoder.EncodeRecord(record);
 
     std::string encoded_record = encoder.GetRecord().ToString();
@@ -121,8 +116,8 @@ TEST(BlobFormatTest, BlobCompressionZSTD) {
   CompressionDict compression_dict(dict, kZSTD, 10);
   UncompressionDict uncompression_dict(dict, true);
 
-  BlobEncoder encoder(kZSTD, &compression_dict);
-  BlobDecoder decoder(&uncompression_dict, kZSTD);
+  BlobEncoder encoder(kZSTD, compression_dict);
+  BlobDecoder decoder(uncompression_dict);
 
   BlobRecord record;
   record.key = "key1";

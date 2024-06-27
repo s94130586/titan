@@ -1,9 +1,9 @@
 #pragma once
 
-#include "file/writable_file_writer.h"
 #include "options/db_options.h"
 #include "rocksdb/cache.h"
 #include "util/compression.h"
+#include "util/file_reader_writer.h"
 
 #include "titan_stats.h"
 
@@ -66,7 +66,7 @@ Slice Compress(const CompressionInfo& info, const Slice& input,
 // If successful, fills "*buffer" with the uncompressed data and
 // points "*output" to it.
 Status Uncompress(const UncompressionInfo& info, const Slice& input,
-                  OwnedSlice* output, MemoryAllocator* allocator = nullptr);
+                  OwnedSlice* output);
 
 void UnrefCacheHandle(void* cache, void* handle);
 
@@ -75,7 +75,7 @@ void DeleteCacheValue(const Slice&, void* value) {
   delete reinterpret_cast<T*>(value);
 }
 
-Status SyncTitanManifest(TitanStats* stats,
+Status SyncTitanManifest(Env* env, TitanStats* stats,
                          const ImmutableDBOptions* db_options,
                          WritableFileWriter* file);
 

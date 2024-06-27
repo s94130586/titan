@@ -24,7 +24,7 @@ class BlobGCPickerTest : public testing::Test {
     auto blob_file_cache = std::make_shared<BlobFileCache>(
         titan_db_options, titan_cf_options, NewLRUCache(128), nullptr);
     blob_storage_.reset(new BlobStorage(titan_db_options, titan_cf_options, 0,
-                                        "", blob_file_cache, nullptr, nullptr));
+                                        blob_file_cache, nullptr));
     basic_blob_gc_picker_.reset(
         new BasicBlobGCPicker(titan_db_options, titan_cf_options, nullptr));
   }
@@ -35,8 +35,7 @@ class BlobGCPickerTest : public testing::Test {
         file_number, data_size + kBlobMaxHeaderSize + kBlobFooterSize, 0, 0, "",
         "");
     f->set_live_data_size(data_size - discardable_size);
-    f->FileStateTransit(BlobFileMeta::FileEvent::kDbStart);
-    f->FileStateTransit(BlobFileMeta::FileEvent::kDbInit);
+    f->FileStateTransit(BlobFileMeta::FileEvent::kDbRestart);
     if (being_gc) {
       f->FileStateTransit(BlobFileMeta::FileEvent::kGCBegin);
     }
@@ -159,32 +158,6 @@ TEST_F(BlobGCPickerTest, ParallelPickGC) {
     RemoveBlobFile(file->file_number());
   }
   UpdateBlobStorage();
-}
-
-TEST_F(BlobGCPickerTest, Fallback) {
-  TitanDBOptions titan_db_options;
-  TitanCFOptions titan_cf_options;
-  titan_cf_options.blob_run_mode = TitanBlobRunMode::kFallback;
-  NewBlobStorageAndPicker(titan_db_options, titan_cf_options);
-  AddBlobFile(1U, 1U << 30, 1U << 30);    // valid_size = 0MB
-  AddBlobFile(2U, 1U << 30, 1U << 30);    // valid_size = 0MB
-  AddBlobFile(3U, 1U << 30, 512U << 20);  // valid_size = 512MB
-  AddBlobFile(4U, 1U << 30, 512U << 20);  // valid_size = 512MB
-  UpdateBlobStorage();
-  auto blob_gc = basic_blob_gc_picker_->PickBlobGC(blob_storage_.get());
-  ASSERT_TRUE(blob_gc != nullptr);
-  int gc_times = 0;
-  while (blob_gc != nullptr) {
-    gc_times++;
-    for (auto file : blob_gc->inputs()) {
-      RemoveBlobFile(file->file_number());
-    }
-    UpdateBlobStorage();
-    if (!blob_gc->trigger_next()) break;
-    blob_gc = basic_blob_gc_picker_->PickBlobGC(blob_storage_.get());
-  }
-  ASSERT_EQ(gc_times, 2);
-  ASSERT_EQ(blob_storage_->NumBlobFiles(), 2);
 }
 
 }  // namespace titandb

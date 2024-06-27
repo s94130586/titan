@@ -15,15 +15,11 @@
 #ifndef OS_WIN
 #include <unistd.h>
 #endif
-#ifdef OS_WIN
-#include <io.h>  // open/close
-#endif
 #include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/types.h>
-
 #include <atomic>
 #include <cinttypes>
 #include <condition_variable>
@@ -63,7 +59,6 @@
 #include "rocksdb/write_batch.h"
 #include "test_util/testutil.h"
 #include "test_util/transaction_test_util.h"
-#include "titan/db.h"
 #include "util/cast_util.h"
 #include "util/compression.h"
 #include "util/crc32c.h"
@@ -77,6 +72,12 @@
 #include "utilities/merge_operators.h"
 #include "utilities/merge_operators/bytesxor.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
+
+#include "titan/db.h"
+
+#ifdef OS_WIN
+#include <io.h>  // open/close
+#endif
 
 using GFLAGS_NAMESPACE::ParseCommandLineFlags;
 using GFLAGS_NAMESPACE::RegisterFlagValidator;
@@ -1379,7 +1380,6 @@ class ReportFileOpEnv : public EnvWrapper {
                    ReportFileOpCounters* counters)
           : target_(std::move(target)), counters_(counters) {}
 
-      using WritableFile::Append;
       Status Append(const Slice& data) override {
         counters_->append_counter_.fetch_add(1, std::memory_order_relaxed);
         Status rv = target_->Append(data);
@@ -3309,15 +3309,57 @@ class Benchmark {
 
     bool ok = CompressSlice(compression_info, input, &compressed);
     int64_t bytes = 0;
-    size_t uncompressed_size = 0;
+    int decompress_size;
     while (ok && bytes < 1024 * 1048576) {
-      constexpr uint32_t compress_format_version = 2;
-
-      CacheAllocationPtr uncompressed = UncompressData(
-          uncompression_info, compressed.data(), compressed.size(),
-          &uncompressed_size, compress_format_version);
-
-      ok = uncompressed.get() != nullptr;
+      CacheAllocationPtr uncompressed;
+      switch (FLAGS_compression_type_e) {
+        case rocksdb::kSnappyCompression: {
+          // get size and allocate here to make comparison fair
+          size_t ulength = 0;
+          if (!Snappy_GetUncompressedLength(compressed.data(),
+                                            compressed.size(), &ulength)) {
+            ok = false;
+            break;
+          }
+          uncompressed = AllocateBlock(ulength, nullptr);
+          ok = Snappy_Uncompress(compressed.data(), compressed.size(),
+                                 uncompressed.get());
+          break;
+        }
+        case rocksdb::kZlibCompression:
+          uncompressed =
+              Zlib_Uncompress(uncompression_info, compressed.data(),
+                              compressed.size(), &decompress_size, 2);
+          ok = uncompressed.get() != nullptr;
+          break;
+        case rocksdb::kBZip2Compression:
+          uncompressed = BZip2_Uncompress(compressed.data(), compressed.size(),
+                                          &decompress_size, 2);
+          ok = uncompressed.get() != nullptr;
+          break;
+        case rocksdb::kLZ4Compression:
+          uncompressed = LZ4_Uncompress(uncompression_info, compressed.data(),
+                                        compressed.size(), &decompress_size, 2);
+          ok = uncompressed.get() != nullptr;
+          break;
+        case rocksdb::kLZ4HCCompression:
+          uncompressed = LZ4_Uncompress(uncompression_info, compressed.data(),
+                                        compressed.size(), &decompress_size, 2);
+          ok = uncompressed.get() != nullptr;
+          break;
+        case rocksdb::kXpressCompression:
+          uncompressed.reset(XPRESS_Uncompress(
+              compressed.data(), compressed.size(), &decompress_size));
+          ok = uncompressed.get() != nullptr;
+          break;
+        case rocksdb::kZSTD:
+          uncompressed = ZSTD_Uncompress(uncompression_info, compressed.data(),
+                                         compressed.size(), &decompress_size);
+          ok = uncompressed.get() != nullptr;
+          break;
+        default:
+          ok = false;
+      }
       bytes += input.size();
       thread->stats.FinishedOps(nullptr, nullptr, 1, kUncompress);
     }
@@ -3735,17 +3777,15 @@ class Benchmark {
     options.compression_opts.zstd_max_train_bytes =
         FLAGS_compression_zstd_max_train_bytes;
     // If this is a block based table, set some related options
-    auto table_options =
-        options.table_factory->GetOptions<BlockBasedTableOptions>();
-    if (table_options != nullptr) {
+    if (options.table_factory->Name() == BlockBasedTableFactory::kName &&
+        options.table_factory->GetOptions() != nullptr) {
+      BlockBasedTableOptions* table_options =
+          reinterpret_cast<BlockBasedTableOptions*>(
+              options.table_factory->GetOptions());
       if (FLAGS_cache_size) {
         table_options->block_cache = cache_;
       }
-      if (FLAGS_bloom_bits < 0) {
-        table_options->filter_policy = BlockBasedTableOptions().filter_policy;
-      } else if (FLAGS_bloom_bits == 0) {
-        table_options->filter_policy.reset();
-      } else {
+      if (FLAGS_bloom_bits >= 0) {
         table_options->filter_policy.reset(NewBloomFilterPolicy(
             FLAGS_bloom_bits, FLAGS_use_block_based_filter));
       }
@@ -4548,11 +4588,11 @@ class Benchmark {
         }
         if (levelMeta.level == 0) {
           for (auto& fileMeta : levelMeta.files) {
-            fprintf(stdout, "Level[%d]: %s(size: %" PRIu64 " bytes)\n",
+            fprintf(stdout, "Level[%d]: %s(size: %" ROCKSDB_PRIszt " bytes)\n",
                     levelMeta.level, fileMeta.name.c_str(), fileMeta.size);
           }
         } else {
-          fprintf(stdout, "Level[%d]: %s - %s(total size: %" PRIu64 " bytes)\n",
+          fprintf(stdout, "Level[%d]: %s - %s(total size: %" PRIi64 " bytes)\n",
                   levelMeta.level, levelMeta.files.front().name.c_str(),
                   levelMeta.files.back().name.c_str(), levelMeta.size);
         }
@@ -4958,6 +4998,7 @@ class Benchmark {
     int64_t puts = 0;
     int64_t found = 0;
     int64_t seek = 0;
+    int64_t seek_found = 0;
     int64_t bytes = 0;
     const int64_t default_value_max = 1 * 1024 * 1024;
     int64_t value_max = default_value_max;
@@ -5092,7 +5133,7 @@ class Benchmark {
             seek++;
             read++;
             if (single_iter->Valid() && single_iter->key().compare(key) == 0) {
-              found++;
+              seek_found++;
             }
             int64_t scan_length =
                 ParetoCdfInversion(u, FLAGS_iter_theta, FLAGS_iter_k,
@@ -5410,15 +5451,19 @@ class Benchmark {
 
     fprintf(stderr, "num reads to do %" PRIu64 "\n", reads_);
     Duration duration(FLAGS_duration, reads_);
+    uint64_t num_seek_to_first = 0;
+    uint64_t num_next = 0;
     while (!duration.Done(1)) {
       if (!iter->Valid()) {
         iter->SeekToFirst();
+        num_seek_to_first++;
       } else if (!iter->status().ok()) {
         fprintf(stderr, "Iterator error: %s\n",
                 iter->status().ToString().c_str());
         abort();
       } else {
         iter->Next();
+        num_next++;
       }
 
       thread->stats.FinishedOps(&db_, db_.db, 1, kSeek);
@@ -6347,29 +6392,17 @@ class Benchmark {
           s.ToString().c_str());
       exit(1);
     }
-    std::unique_ptr<Replayer> replayer;
-    s = db_with_cfh->db->NewDefaultReplayer(db_with_cfh->cfh,
-                                            std::move(trace_reader), &replayer);
-    if (!s.ok()) {
-      fprintf(stderr,
-              "Encountered an error creating a default Replayer. "
-              "Error: %s\n",
-              s.ToString().c_str());
-      exit(1);
-    }
-    s = replayer->Prepare();
-    if (!s.ok()) {
-      fprintf(stderr, "Prepare for replay failed. Error: %s\n",
-              s.ToString().c_str());
-    }
-    s = replayer->Replay(ReplayOptions(1, FLAGS_trace_replay_fast_forward),
-                         nullptr);
-    replayer.reset();
+    Replayer replayer(db_with_cfh->db, db_with_cfh->cfh,
+                      std::move(trace_reader));
+    replayer.SetFastForward(
+        static_cast<uint32_t>(FLAGS_trace_replay_fast_forward));
+    s = replayer.Replay();
     if (s.ok()) {
-      fprintf(stdout, "Replay completed from trace_file: %s\n",
+      fprintf(stdout, "Replay started from trace_file: %s\n",
               FLAGS_trace_file.c_str());
     } else {
-      fprintf(stderr, "Replay failed. Error: %s\n", s.ToString().c_str());
+      fprintf(stderr, "Starting replay failed. Error: %s\n",
+              s.ToString().c_str());
     }
   }
 };

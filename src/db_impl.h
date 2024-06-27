@@ -7,6 +7,7 @@
 
 #include "blob_file_manager.h"
 #include "blob_file_set.h"
+#include "blob_index_merge_operator.h"
 #include "table_factory.h"
 #include "titan/db.h"
 #include "titan_stats.h"
@@ -24,35 +25,6 @@ struct TitanColumnFamilyInfo {
 
 class TitanCompactionFilterFactory;
 class TitanCompactionFilter;
-
-class TitanColumnFamilyHandle : public rocksdb::ColumnFamilyHandleImpl {
- public:
-  TitanColumnFamilyHandle(rocksdb::ColumnFamilyHandleImpl* rocks_cf_handle,
-                          std::shared_ptr<BlobStorage> blob_storage,
-                          bool owned = true)
-      : rocksdb::ColumnFamilyHandleImpl(*rocks_cf_handle),
-        rocks_cf_handle_(rocks_cf_handle),
-        owned_(owned),
-        blob_storage_(blob_storage) {}
-
-  ~TitanColumnFamilyHandle() {
-    if (owned_) delete rocks_cf_handle_;
-  }
-
-  std::shared_ptr<BlobStorage> GetBlobStorage() { return blob_storage_; }
-
- private:
-  // Keep a reference to the rocksdb::ColumnFamilyHandleImpl, and delete it
-  // when this TitanColumnFamilyHandle is deleted. In case RocksDB internally
-  // uses the pointer to the rocksdb::ColumnFamilyHandleImpl, we can't delete
-  // it until the TitanColumnFamilyHandle is deleted.
-  rocksdb::ColumnFamilyHandleImpl* rocks_cf_handle_;
-  // Whether it owns the rocksdb::ColumnFamilyHandleImpl*, if it owns, it delete
-  // the handle when dropped
-  bool owned_;
-
-  std::shared_ptr<BlobStorage> blob_storage_;
-};
 
 class TitanDBImpl : public TitanDB {
  public:
@@ -73,11 +45,6 @@ class TitanDBImpl : public TitanDB {
   Status DropColumnFamilies(
       const std::vector<ColumnFamilyHandle*>& handles) override;
 
-  using TitanDB::DefaultColumnFamily;
-  ColumnFamilyHandle* DefaultColumnFamily() const override {
-    return default_cf_handle_;
-  }
-
   Status DestroyColumnFamilyHandle(ColumnFamilyHandle* column_family) override;
 
   using TitanDB::CompactFiles;
@@ -96,13 +63,11 @@ class TitanDBImpl : public TitanDB {
              const Slice& key, const Slice& value) override;
 
   using TitanDB::Write;
-  Status Write(const WriteOptions& options, WriteBatch* updates,
-               PostWriteCallback* callback) override;
+  Status Write(const WriteOptions& options, WriteBatch* updates) override;
 
   using TitanDB::MultiBatchWrite;
   Status MultiBatchWrite(const WriteOptions& options,
-                         std::vector<WriteBatch*>&& updates,
-                         PostWriteCallback* callback) override;
+                         std::vector<WriteBatch*>&& updates) override;
 
   using TitanDB::Delete;
   Status Delete(const WriteOptions& options, ColumnFamilyHandle* column_family,
@@ -145,23 +110,13 @@ class TitanDBImpl : public TitanDB {
 
   void ReleaseSnapshot(const Snapshot* snapshot) override;
 
-  using TitanDB::DisableFileDeletions;
-  Status DisableFileDeletions() override;
-
-  using TitanDB::EnableFileDeletions;
-  Status EnableFileDeletions(bool force) override;
-
-  using TitanDB::GetAllTitanFiles;
-  Status GetAllTitanFiles(std::vector<std::string>& files,
-                          std::vector<VersionEdit>* edits) override;
-
   Status DeleteFilesInRanges(ColumnFamilyHandle* column_family,
                              const RangePtr* ranges, size_t n,
                              bool include_end = true) override;
 
   Status DeleteBlobFilesInRanges(ColumnFamilyHandle* column_family,
-                                 const RangePtr* ranges, size_t n,
-                                 bool include_end = true) override;
+                                     const RangePtr* ranges, size_t n,
+                                     bool include_end = true) override;
 
   using TitanDB::GetOptions;
   Options GetOptions(ColumnFamilyHandle* column_family) const override;
@@ -186,9 +141,7 @@ class TitanDBImpl : public TitanDB {
   bool GetIntProperty(ColumnFamilyHandle* column_family, const Slice& property,
                       uint64_t* value) override;
 
-  bool initialized() const {
-    return initialized_.load(std::memory_order_acquire);
-  }
+  bool initialized() const { return initialized_; }
 
   void OnFlushCompleted(const FlushJobInfo& flush_job_info);
 
@@ -214,11 +167,6 @@ class TitanDBImpl : public TitanDB {
     return blob_file_set_->GetBlobStorage(column_family->GetID()).lock();
   }
 
-  BlobFileSet* TEST_GetBlobFileSet() {
-    MutexLock l(&mutex_);
-    return blob_file_set_.get();
-  }
-
  private:
   class FileManager;
   friend class FileManager;
@@ -226,11 +174,8 @@ class TitanDBImpl : public TitanDB {
   friend class BaseDbListener;
   friend class TitanDBTest;
   friend class TitanThreadSafetyTest;
-  friend class TitanGCStatsTest;
   friend class TitanCompactionFilterFactory;
   friend class TitanCompactionFilter;
-  friend class TableBuilderTest;
-  friend class TitanThreadSafetyTest;
 
   Status OpenImpl(const std::vector<TitanCFDescriptor>& descs,
                   std::vector<ColumnFamilyHandle*>* handles);
@@ -238,11 +183,6 @@ class TitanDBImpl : public TitanDB {
   Status ValidateOptions(
       const TitanDBOptions& options,
       const std::vector<TitanCFDescriptor>& column_families) const;
-
-  Status ExtractTitanCfOptions(
-      ColumnFamilyHandle* column_family,
-      std::unordered_map<std::string, std::string>& new_options,
-      MutableTitanCFOptions& mutable_cf_options, bool& changed);
 
   Status GetImpl(const ReadOptions& options, ColumnFamilyHandle* handle,
                  const Slice& key, PinnableSlice* value);
@@ -256,7 +196,7 @@ class TitanDBImpl : public TitanDB {
                             ColumnFamilyHandle* handle,
                             std::shared_ptr<ManagedSnapshot> snapshot);
 
-  Status AsyncInitializeGC(const std::vector<ColumnFamilyHandle*>& cf_handles);
+  Status InitializeGC(const std::vector<ColumnFamilyHandle*>& cf_handles);
 
   Status ExtractGCStatsFromTableProperty(
       const std::shared_ptr<const TableProperties>& table_properties,
@@ -324,8 +264,6 @@ class TitanDBImpl : public TitanDB {
 
   void DumpStats();
 
-  std::string GenerateCachePrefix();
-
   FileLock* lock_{nullptr};
   // The lock sequence must be Titan.mutex_.Lock() -> Base DB mutex_.Lock()
   // while the unlock sequence must be Base DB mutex.Unlock() ->
@@ -342,11 +280,10 @@ class TitanDBImpl : public TitanDB {
   std::string dirname_;
   Env* env_;
   EnvOptions env_options_;
-  DBImpl* db_impl_;  // Base DB impl
+  DBImpl* db_impl_;
   TitanDBOptions db_options_;
   std::unique_ptr<Directory> directory_;
-
-  ColumnFamilyHandle* default_cf_handle_{nullptr};
+  std::shared_ptr<BlobIndexMergeOperator> shared_merge_operator_;
 
   std::atomic<bool> initialized_{false};
 
@@ -370,8 +307,6 @@ class TitanDBImpl : public TitanDB {
   // handle for dump internal stats at fixed intervals.
   std::unique_ptr<RepeatableThread> thread_dump_stats_;
 
-  std::unique_ptr<port::Thread> thread_initialize_gc_;
-
   std::unique_ptr<BlobFileSet> blob_file_set_;
   std::set<uint64_t> pending_outputs_;
   std::shared_ptr<BlobFileManager> blob_manager_;
@@ -388,13 +323,6 @@ class TitanDBImpl : public TitanDB {
   int unscheduled_gc_ = 0;
   // REQUIRE: mutex_ held.
   int drop_cf_requests_ = 0;
-
-  // PurgeObsoleteFiles, DisableFileDeletions and EnableFileDeletions block
-  // on the mutex to avoid contention.
-  mutable port::Mutex delete_titandb_file_mutex_;
-
-  // REQUIRES: access with delete_titandb_file_mutex_ held.
-  int disable_titandb_file_deletions_ = 0;
 
   std::atomic_bool shuting_down_{false};
 };

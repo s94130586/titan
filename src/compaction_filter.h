@@ -5,7 +5,6 @@
 
 #include "db_impl.h"
 #include "rocksdb/compaction_filter.h"
-#include "titan_logging.h"
 #include "util/mutexlock.h"
 
 namespace rocksdb {
@@ -32,48 +31,23 @@ class TitanCompactionFilter final : public CompactionFilter {
 
   const char *Name() const override { return filter_name_.c_str(); }
 
-  bool IsStackedBlobDbInternalCompactionFilter() const override { return true; }
-
-  Decision UnsafeFilter(int level, const Slice &key, SequenceNumber seqno,
-                        ValueType value_type, const Slice &value,
-                        std::string *new_value,
-                        std::string *skip_until) const override {
-    Status s;
-    Slice user_key = key;
-
-    // Since IsStackedBlobDbInternalCompactionFilter was implemented as true,
-    // the key is an internal key when value_type is kBlobIndex, which is caused
-    // by a hack in RocksDB.
-    if (value_type == kBlobIndex) {
-      ParsedInternalKey ikey;
-      s = ParseInternalKey(key, &ikey, false /*log_err_key*/);
-      if (s.ok()) {
-        user_key = ikey.user_key;
-      } else {
-        TITAN_LOG_ERROR(db_->db_options_.info_log,
-                        "[%s] Unable to parse internal key", cf_name_.c_str());
-        {
-          MutexLock l(&db_->mutex_);
-          db_->SetBGError(s);
-        }
-        return Decision::kKeep;
-      }
-    }
-
+  Decision FilterV2(int level, const Slice &key, ValueType value_type,
+                    const Slice &value, std::string *new_value,
+                    std::string *skip_until) const override {
     if (skip_value_) {
-      return original_filter_->UnsafeFilter(level, user_key, seqno, value_type,
-                                            Slice(), new_value, skip_until);
+      return original_filter_->FilterV2(level, key, value_type, Slice(),
+                                        new_value, skip_until);
     }
     if (value_type != kBlobIndex) {
-      return original_filter_->UnsafeFilter(level, user_key, seqno, value_type,
-                                            value, new_value, skip_until);
+      return original_filter_->FilterV2(level, key, value_type, value,
+                                        new_value, skip_until);
     }
 
     BlobIndex blob_index;
     Slice original_value(value.data());
-    s = blob_index.DecodeFrom(&original_value);
+    Status s = blob_index.DecodeFrom(&original_value);
     if (!s.ok()) {
-      TITAN_LOG_ERROR(db_->db_options_.info_log,
+      ROCKS_LOG_ERROR(db_->db_options_.info_log,
                       "[%s] Unable to decode blob index", cf_name_.c_str());
       // TODO(yiwu): Better to fail the compaction as well, but current
       // compaction filter API doesn't support it.
@@ -82,6 +56,10 @@ class TitanCompactionFilter final : public CompactionFilter {
         db_->SetBGError(s);
       }
       // Unable to decode blob index. Keeping the value.
+      return Decision::kKeep;
+    }
+    if (BlobIndex::IsDeletionMarker(blob_index)) {
+      // TODO(yiwu): handle deletion marker at bottom level.
       return Decision::kKeep;
     }
 
@@ -95,8 +73,8 @@ class TitanCompactionFilter final : public CompactionFilter {
       // TODO(yiwu): Tell the two cases apart.
       return Decision::kKeep;
     } else if (s.ok()) {
-      auto decision = original_filter_->UnsafeFilter(
-          level, user_key, seqno, kValue, record.value, new_value, skip_until);
+      auto decision = original_filter_->FilterV2(
+          level, key, kValue, record.value, new_value, skip_until);
 
       // It would be a problem if it change the value whereas the value_type
       // is still kBlobIndex. For now, just returns kKeep.

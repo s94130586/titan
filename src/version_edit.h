@@ -1,12 +1,11 @@
 #pragma once
 
-#include <cinttypes>
-
 #include <set>
 
+#include "blob_format.h"
 #include "rocksdb/slice.h"
 
-#include "blob_format.h"
+#include <inttypes.h>
 
 namespace rocksdb {
 namespace titandb {
@@ -41,8 +40,6 @@ class VersionEdit {
   Status DecodeFrom(Slice* src);
 
   friend bool operator==(const VersionEdit& lhs, const VersionEdit& rhs);
-
-  void Dump(bool with_keys) const;
 
  private:
   friend class BlobFileSet;

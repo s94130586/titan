@@ -6,9 +6,6 @@ titandb_bench
 titandb_stress
 
 build/
-rocksdb
-Makefile
-*.cmake
 .idea/
 .vscode/
 cmake-build-debug/
